@@ -1,11 +1,12 @@
 import type { ClientKeyEvent, ClientModule, ClientSurface } from 'claude-code'
 
-import type { Doc, EditorProps } from '../types'
+import type { Doc, EditorProps, EditorRequest, Op } from '../types'
 import {
   applyEdits, backspace, clamp, compare, dedent, deleteForward, deleteWordBack, findAll, killToEnd,
   killToStart, merge, move, newline, nextMatch, rangeOf, textIn, typeText,
 } from './editor/model'
 import type { Caret, Edit, Motion, Range, Spot } from './editor/model'
+import { batch, diffOps, fullTextOps, mapCarets } from './editor/sync'
 import { cells, colAt, indentUnit, show, split, wordAt } from './editor/text'
 import { hashText } from './hash'
 
@@ -21,14 +22,16 @@ type Find = {
 
 type Click = { at: number; row: number; col: number; count: number }
 
+type Pending = { request: EditorRequest; sentAt: number; isSave: boolean }
+
+type Loading = { rev: number; count: number; parts: string[]; index: number }
+
 type State = {
   lines: string[]
   // carets[0] is the primary caret: the view follows it and the status shows it
   carets: Caret[]
   top: number
-  rev: number
   isDirty: boolean
-  inflight?: string
   undo: Snapshot[]
   redo: Snapshot[]
   snappedAt: number
@@ -38,6 +41,16 @@ type State = {
   pasteSeq: number
   find: Find
   click?: Click
+  // The sync with the hooks: `sent` is the text the hooks hold once `outbox`
+  // lands on version `base`; one request is out at a time
+  base: number
+  sent: string[]
+  outbox: Op[]
+  wantSave: boolean
+  savingLines?: string[]
+  seq: number
+  pending?: Pending
+  loading?: Loading
 }
 
 type Surface = ClientSurface<State>
@@ -51,6 +64,7 @@ const MATCH_BACKGROUND = '#5c4b12'
 const WHEEL_ROWS = 3
 const UNDO_DEPTH = 100
 const CLICK_MS = 400
+const RESEND_MS = 1500
 const NAMED = new Set([
   'up', 'down', 'left', 'right', 'return', 'enter', 'tab', 'backspace', 'delete',
   'pageup', 'pagedown', 'home', 'end', 'escape', 'insert',
@@ -290,11 +304,79 @@ function handle(state: State, k: ClientKeyEvent, page: number): Outcome {
   return { state: edit(state, typeText(k.key)) }
 }
 
-function save(s: Surface, state: State, isActive?: boolean): State {
-  const text = state.lines.join('\n')
-  s.post({ type: 'save', text, ...(isActive === undefined ? {} : { isActive }) })
+function save(state: State): State {
+  return { ...state, wantSave: true }
+}
 
-  return { ...state, isDirty: false, inflight: text }
+// Queues the ops that bring the hooks' text up to the editor's
+function queue(state: State): State {
+  if (state.lines === state.sent || state.loading) return state
+
+  return { ...state, outbox: [...state.outbox, ...diffOps(state.sent, state.lines)], sent: state.lines }
+}
+
+// Sends the next request when none is out: a chunk while loading, else ops
+function pump(s: Surface, state: State): State {
+  if (state.pending) return state
+  const seq = state.seq + 1
+  let request: EditorRequest
+  let next = state
+  let isSave = false
+  if (state.loading) {
+    request = { type: 'chunk', seq, rev: state.loading.rev, index: state.loading.index }
+  } else if (state.outbox.length > 0 || state.wantSave) {
+    const ops = batch(state.outbox)
+    const rest = state.outbox.slice(ops.length)
+    isSave = state.wantSave && rest.length === 0
+    request = {
+      type: 'sync',
+      seq,
+      base: state.base,
+      ops,
+      ...(isSave ? { save: hashText(state.sent.join('\n')) } : {}),
+      isActive: true,
+    }
+    next = {
+      ...state,
+      outbox: rest,
+      wantSave: isSave ? false : state.wantSave,
+      ...(isSave ? { savingLines: state.lines } : {}),
+    }
+  } else {
+    return state
+  }
+  s.post(request)
+
+  return { ...next, seq, pending: { request, sentAt: Date.now(), isSave } }
+}
+
+function sync(s: Surface, state: State): State {
+  return pump(s, queue(state))
+}
+
+// Takes the hooks' answer to the request that is out
+function answered(state: State, props: EditorProps): State {
+  const pending = state.pending
+  const reply = props.reply
+  if (!pending || !reply || reply.seq !== pending.request.seq) return state
+  const request = pending.request
+  const base = { ...state, pending: undefined }
+  if (request.type === 'chunk') {
+    const loading = state.loading
+    if (!loading || loading.rev !== request.rev || reply.chunk === undefined) return base
+    const parts = [...loading.parts, reply.chunk]
+    if (parts.length < loading.count) return { ...base, loading: { ...loading, parts, index: loading.index + 1 } }
+    const lines = split(parts.join(''))
+
+    return { ...base, ...reload(base, lines), sent: lines, outbox: [], base: loading.rev, loading: undefined, isDirty: false }
+  }
+  if (reply.isStale) {
+    // The hooks' copy went its own way: send the whole text again
+    return { ...base, outbox: fullTextOps(state.lines), sent: state.lines, base: props.rev, wantSave: state.wantSave || pending.isSave }
+  }
+  if (pending.isSave && state.lines === state.savingLines) return { ...base, isDirty: false }
+
+  return base
 }
 
 function scrollBy(state: State, by: number): State {
@@ -303,12 +385,14 @@ function scrollBy(state: State, by: number): State {
   return { ...state, top: Math.max(0, Math.min(last, state.top + by * WHEEL_ROWS)) }
 }
 
-function fresh(doc: Doc): State {
+function fresh(doc: Doc, seq: number): State {
+  const lines = ['']
+  const isEmpty = doc.size === 0
+
   return {
-    lines: split(doc.text),
+    lines,
     carets: [{ row: 0, col: 0 }],
     top: 0,
-    rev: doc.rev,
     isDirty: false,
     undo: [],
     redo: [],
@@ -318,33 +402,35 @@ function fresh(doc: Doc): State {
     wheelSeq: 0,
     pasteSeq: 0,
     find: CLOSED_FIND,
+    base: doc.rev,
+    sent: lines,
+    outbox: [],
+    wantSave: false,
+    seq,
+    ...(isEmpty ? {} : { loading: { rev: doc.rev, count: doc.chunks, parts: [], index: 0 } }),
   }
 }
 
-function reload(state: State, text: string): State {
-  const lines = split(text)
-
-  return { ...state, lines, carets: merge(state.carets.map(caret => clamp(lines, caret))) }
+// New text from the hooks: the carets follow the text around them
+function reload(state: State, lines: string[]): Pick<State, 'lines' | 'carets'> {
+  return { lines, carets: merge(mapCarets(state.carets, diffOps(state.lines, lines), lines)) }
 }
 
+// A new version from the hooks: a save, a format, a change on disk or another file
 function adopt(state: State, doc: Doc): State {
-  const text = state.lines.join('\n')
-  const textHash = hashText(text)
-  const isOurSave = doc.savedHash !== undefined &&
-    (doc.savedHash === textHash || (state.inflight !== undefined && doc.savedHash === hashText(state.inflight)))
-  const isOtherFile = doc.path !== state.doc.path
-  if (isOtherFile) return fresh(doc)
+  if (doc.path !== state.doc.path) return { ...fresh(doc, state.seq), pending: state.pending }
 
-  const base = { ...state, rev: doc.rev, doc }
-  if (isOurSave) {
-    const isUntouched = textHash === doc.savedHash
-    if (!isUntouched) return { ...base, inflight: undefined }
-
-    return { ...reload(base, doc.text), inflight: undefined, isDirty: false }
+  const next = { ...state, doc }
+  const textHash = hashText(state.lines.join('\n'))
+  if (doc.hash === textHash) return { ...next, base: doc.rev, sent: state.lines, outbox: [], loading: undefined }
+  const isOurSave = state.savingLines !== undefined && doc.savedHash === hashText(state.savingLines.join('\n'))
+  const isUntouched = state.lines === state.savingLines || !state.isDirty
+  if ((isOurSave && state.lines === state.savingLines) || isUntouched) {
+    return { ...next, outbox: [], loading: { rev: doc.rev, count: doc.chunks, parts: [], index: 0 } }
   }
-  if (state.isDirty || state.inflight !== undefined) return base
 
-  return reload(base, doc.text)
+  // Edits made since win: the hooks get the whole text again
+  return { ...next, outbox: fullTextOps(state.lines), sent: state.lines, base: doc.rev }
 }
 
 // Where a pointer cell lands in the text
@@ -383,17 +469,25 @@ function clicked(state: State, spot: Spot, isAdding: boolean, isExtending: boole
 function start(s: Surface, doc: Doc): State {
   s.onKey(k => {
     const current = s.state
-    if (!current) return
+    if (!current || current.loading) return
     const rows = editRows(s, current)
     const out = handle(current, k, rows - 1)
-    if (out.isSave) {
-      s.setState(follow(save(s, out.state, true), editRows(s, out.state)))
+    // A copy goes out alone; the ops wait for the next key or redraw
+    if (out.copy !== undefined) {
+      s.post({ type: 'copy', text: out.copy, isActive: true })
+      s.setState(follow(out.state, editRows(s, out.state)))
       return
     }
-    if (out.copy !== undefined) s.post({ type: 'copy', text: out.copy, isActive: true })
-    // The hooks keep the latest text so closing the pane can still save it
-    else if (out.state.lines !== current.lines) s.post({ type: 'draft', text: out.state.lines.join('\n'), isActive: true })
-    s.setState(follow(out.state, editRows(s, out.state)))
+    const next = out.isSave ? save(out.state) : out.state
+    s.setState(follow(sync(s, next), editRows(s, next)))
+  })
+  // A post can be lost when another one replaces it in the same frame
+  s.every(250, () => {
+    const current = s.state
+    const pending = current?.pending
+    if (!current || !pending || Date.now() - pending.sentAt < RESEND_MS) return
+    s.post(pending.request)
+    s.setState({ ...current, pending: { ...pending, sentAt: Date.now() } })
   })
 
   s.onPointer(e => {
@@ -402,8 +496,7 @@ function start(s: Surface, doc: Doc): State {
     // No blur reaches a Client, so the pointer leaving the editor saves; the
     // editor stays the paste target until the person types into the prompt
     if (e.type === 'leave') {
-      const isPending = current.isDirty && current.inflight === undefined
-      if (isPending) s.setState(save(s, current))
+      if (current.isDirty) s.setState(sync(s, save(current)))
       return
     }
     if (e.type === 'up') {
@@ -425,23 +518,27 @@ function start(s: Surface, doc: Doc): State {
     s.setState(follow(withCarets(current, [dragged, ...current.carets.slice(1)]), rows))
   })
 
-  return fresh(doc)
+  return fresh(doc, Date.now())
 }
 
 const Editor: ClientModule<EditorProps, State> = (props, s) => {
   const { Box, Text, Code } = s.elements
-  const { isFocused, wheel, paste: pasted, ...doc } = props
+  const { isFocused, wheel, paste: pasted, reply: _reply, ...doc } = props
   let state = s.state ?? start(s, doc)
-  if (doc.rev > state.rev) state = follow(adopt(state, doc), editRows(s, state))
+  state = answered(state, props)
+  // Props arrive as new objects on every redraw, so compare what they say
+  const isNewDoc = JSON.stringify(doc) !== JSON.stringify(state.doc)
+  if (doc.rev > state.doc.rev) state = follow(adopt(state, doc), editRows(s, state))
+  else if (isNewDoc && doc.rev === state.doc.rev) state = { ...state, doc }
   if (wheel && wheel.seq > state.wheelSeq) state = { ...scrollBy(state, wheel.by), wheelSeq: wheel.seq }
-  if (pasted && pasted.seq > state.pasteSeq) {
+  if (pasted && pasted.seq > state.pasteSeq && !state.loading) {
     state = { ...follow(paste(state, pasted.text), editRows(s, state)), pasteSeq: pasted.seq }
-    s.post({ type: 'draft', text: state.lines.join('\n') })
   }
   if (isFocused !== undefined && isFocused !== state.wasFocused) {
     const isLeaving = state.wasFocused && !isFocused
-    state = { ...(isLeaving && state.isDirty ? save(s, state) : state), wasFocused: isFocused }
+    state = { ...(isLeaving && state.isDirty ? save(state) : state), wasFocused: isFocused }
   }
+  state = sync(s, state)
   if (state !== s.state) s.setState(state)
 
   const rows = editRows(s, state)
@@ -540,7 +637,9 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
     ...state.doc.diagnostics.filter(d => d !== near),
   ].slice(0, 3)
 
-  const mark = state.isDirty ? 'unsaved' : state.inflight !== undefined ? 'saving' : state.doc.status
+  const mark = state.loading
+    ? `loading ${state.loading.index + 1} of ${state.loading.count}`
+    : state.pending?.isSave ? 'saving' : state.isDirty ? 'unsaved' : state.doc.status
   const count = state.doc.diagnostics.length
   const name = state.doc.path.slice(state.doc.path.lastIndexOf('/') + 1)
   const carets = state.carets.length > 1 ? `  ${state.carets.length} carets` : ''

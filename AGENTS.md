@@ -4,8 +4,10 @@ Claude Code mod (a function-hooks plugin). `hooks/register.tsx` exports `registe
 
 ## Rules
 
-- The editor holds the document. The hooks hold the file on disk. They talk only through `ui.message` posts and `Client` props.
-- Props and posts have a limit of 100000 characters. Never send the full text twice in one message. Use `hashText` from `hooks/hash.ts` to name a text.
+- The editor holds the document. The hooks hold a mirror of it and the file on disk. They talk only through `ui.message` posts and `Client` props.
+- The sync is in `hooks/editor/sync.ts`. The editor sends `sync` requests with range ops and `chunk` requests for downloads. One request is out at a time, and the editor sends it again until the reply with its `seq` comes. A later post in the same frame replaces an earlier one, so never rely on a post without a reply.
+- Props and posts have a limit of 100000 characters. Text moves in pieces of `PIECE`. Use `hashText` from `hooks/hash.ts` to name a text.
+- Compare props by content, not by reference: each redraw hands new objects, and a `setState` on every render unmounts the `Client`.
 - Save only on Cmd+S, when the pointer leaves the editor, on a prompt submit, on pane close and on session end. Do not add a timer.
 - Draw only the visible lines. Each run of `Code` lines sits in a `Box` with a fixed height, because `Code` grows into free room.
 - Draw the caret and the selection as `position="absolute"` overlays on the `Code` run, so the caret line keeps its colors. Count cells with `cells()`, because wide characters take 2 cells.

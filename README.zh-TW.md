@@ -92,11 +92,13 @@ keybind = cmd+x=text:\x1bx
 
 - `hooks/register.tsx` 註冊 `/edit` 和 `open` 工具，負責讀寫檔案，每次存檔時跑格式化和 lint。
 - `hooks/editor.tsx` 是 `Client` surface module。它保存文字、游標、選取和復原紀錄，只畫看得到的行。
+- 編輯器把每次修改用小的範圍操作送給 hooks，hooks 保留一份同步的文字。存檔只送文字的雜湊值，對不上時編輯器會把全文重送一次。
+- 開檔時全文每批 60000 字元送進編輯器，因為引擎限制每則訊息 100000 字元。
 - 點進或在編輯器打字後，貼上會進編輯器，直到你再在 prompt 打字。
 
 ## 限制
 
-- 檔案上限 90000 字元，因為引擎限制每則訊息 100000 字元。
+- 檔案上限 4 MiB，是引擎一次能讀的最大量。1 MB 的檔案大約 2 秒開好。
 - lint 在存檔時跑，不會邊打邊跑。目前沒有自動補全。
 - Cmd+Z 留給 Ghostty，它用來重開關掉的分頁。Claude Code 會先攔走 Ctrl+Z、Ctrl+D、Ctrl+C，所以復原用 Option+Z。
 

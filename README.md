@@ -89,12 +89,14 @@ Cmd+S and Cmd+X then send Option+S and Option+X in every program.
 ## How it works
 
 - `hooks/register.tsx` registers `/edit` and the `open` tool, reads and writes the file, and runs the formatter and the linter on each save.
-- `hooks/editor.tsx` is a `Client` surface module. It holds the text, the caret, the selection and the undo history. It draws only the visible lines.
+- `hooks/editor.tsx` is a `Client` surface module. It holds the text, the carets, the selections and the undo history. It draws only the visible lines.
+- The editor sends each change to the hooks as small range ops, and the hooks keep a copy of the text. A save sends only a hash of the text. When the hash does not match, the editor sends the whole text again.
+- An open file comes to the editor in pieces of 60000 characters, because the engine limits a message to 100000 characters.
 - A paste goes to the editor after you click or type in it, until you type in the prompt again.
 
 ## Limits
 
-- A file has a limit of 90000 characters, because the engine limits a message to 100000 characters.
+- A file has a limit of 4 MiB, the most that the engine reads at once. A 1 MB file opens in about 2 seconds.
 - Lint runs on save, not as you type. There is no completion yet.
 - Cmd+Z stays with Ghostty, which uses it to reopen a closed tab. Claude Code takes Ctrl+Z, Ctrl+D and Ctrl+C before the editor sees them, so undo is Option+Z.
 
@@ -110,7 +112,7 @@ Facts for coding agents and LLM tools. The rules for changing the code are in [A
 - **Verify**: `bunx -p typescript tsc -p tsconfig.json && CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude plugin test .`
 - **Config**: none
 - **Secrets**: none
-- **Limits**: 90000 characters a file. Formatters `deno`, `uvx ruff` and `gofmt` must be on the PATH.
+- **Limits**: 4 MiB a file. Formatters `deno`, `uvx ruff` and `gofmt` must be on the PATH.
 
 ## Development
 
