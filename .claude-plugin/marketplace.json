@@ -1,0 +1,22 @@
+{
+  "name": "edit-mod",
+  "owner": {
+    "name": "zyx1121",
+    "url": "https://github.com/zyx1121"
+  },
+  "description": "Marketplace for the edit-mod plugin: a code editor pane inside Claude Code.",
+  "plugins": [
+    {
+      "name": "edit-mod",
+      "source": "./",
+      "description": "/edit <path>: a code editor pane with highlighting, lint and format on save.",
+      "category": "productivity",
+      "tags": [
+        "editor",
+        "pane",
+        "lint",
+        "function-hooks"
+      ]
+    }
+  ]
+}

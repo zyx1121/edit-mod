@@ -1,0 +1,101 @@
+<!-- 翻译自 README.md @ docs/readme-template-v2。只翻 "For AI agents" 以上的章节，英文版更新时一起改。 -->
+
+<div align="center">
+
+<h1>edit-mod</h1>
+
+<p><strong>Claude Code 里的代码编辑器 pane，有语法高亮、lint，保存时自动格式化。</strong></p>
+
+[![CI](https://img.shields.io/github/actions/workflow/status/zyx1121/edit-mod/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/zyx1121/edit-mod/actions)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-mod-d97757?style=flat-square)](https://github.com/anthropics/claude-code/tree/main/mods)
+[![License](https://img.shields.io/github/license/zyx1121/edit-mod?style=flat-square)](LICENSE)
+
+[English](README.md) | [繁體中文](README.zh-TW.md) | **简体中文**
+
+</div>
+
+```
+│1 const a = { b: 1 };
+│2 export function add(x: number, y: number) {
+│3   return x + y▌
+│4 }
+│
+│1:7 no-unused-vars `a` is never used
+│demo.ts  3:15  saved, formatted  1 problems
+```
+
+小改动自己动手，常常比写 prompt 快。切到另一个编辑器又会打断专注。edit-mod 把文件开在对话旁边的 pane，你和 Claude 在同一个终端里改同一个文件。
+
+## 功能
+
+- **用 prompt 打开文件**：说「我要改 demo.ts」，Claude 就用 `open` 工具打开 pane。`/edit <路径>` 也可以。
+- **高亮与 lint**：引擎负责语法高亮。lint 错误会标红行号，并列在代码下方。
+- **保存时格式化**：JavaScript、TypeScript、JSON、CSS、Markdown、YAML、HTML 用 `deno fmt`，Python 用 `ruff`，Go 用 `gofmt`。
+- **macOS 按键**：Cmd 和 Option 搭配方向键与 Delete，还有 Cmd+S、Cmd+X、Cmd+V。撤销是 Ctrl+Z。
+- **鼠标**：点击放置光标，拖动选择并复制，滚轮滚动。
+- **跟着 Claude**：Claude 改了打开的文件，pane 会重新加载。
+
+## 快速开始
+
+Function hooks 还在抢先体验阶段。在 shell 配置文件里打开它：
+
+```sh
+export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
+```
+
+接着在 Claude Code 安装这个 mod：
+
+```
+/plugin marketplace add zyx1121/edit-mod
+/plugin install edit-mod@edit-mod
+```
+
+打开新的 session，执行 `/edit <路径>`。点一下 pane 就能输入，按 Esc 把键盘还给 prompt。
+
+## 使用方式
+
+| 按键或动作 | 作用 |
+|------------|------|
+| Cmd+S | 保存并格式化 |
+| Cmd+X、Cmd+V | 剪切选区，粘贴到光标位置 |
+| 拖动、Shift 加方向键 | 选择。拖动会顺便复制 |
+| Ctrl+Z | 撤销 |
+| Cmd+Left、Cmd+Right | 跳到行首或行尾 |
+| Option+Left、Option+Right | 跳一个词 |
+| Cmd+Delete、Option+Delete | 删到行首、删一个词 |
+| 滚轮 | 每格滚 3 行 |
+
+鼠标移出 pane、提交 prompt、关闭 pane、session 结束时也会保存。不会定时保存。
+
+### Ghostty 按键
+
+Ghostty 不会把 Cmd 加字母传给程序。在 Ghostty 配置里加这几行，Cmd+S、Cmd+X 和编辑器背景才会正常：
+
+```
+background-opacity-cells = true
+keybind = cmd+s=text:\x1bs
+keybind = cmd+x=text:\x1bx
+```
+
+之后在所有程序里，Cmd+S 和 Cmd+X 都会发送 Option+S 和 Option+X。
+
+## 运作方式
+
+- `hooks/register.tsx` 注册 `/edit` 和 `open` 工具，负责读写文件，每次保存时运行格式化和 lint。
+- `hooks/editor.tsx` 是 `Client` surface module。它保存文本、光标、选区和撤销记录，只画可见的行。
+- 点进或在编辑器输入后，粘贴会进编辑器，直到你再在 prompt 输入。
+
+## 限制
+
+- 文件上限 90000 字符，因为引擎限制每条消息 100000 字符。
+- 光标所在行和选中的行没有语法颜色。
+- lint 在保存时运行，不会边输入边运行。目前没有自动补全。
+- Cmd+Z 留给 Ghostty，它用来重新打开关掉的标签页。
+
+## 其他
+
+给 AI agent 的结构化信息与开发说明在[英文版](README.md#for-ai-agents)。
+
+## 授权
+
+[MIT](LICENSE)

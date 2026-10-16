@@ -1,0 +1,10 @@
+{
+  "name": "edit-mod",
+  "version": "0.1.0",
+  "description": "/edit <path>: edit a file in a pane beside the transcript, with syntax highlighting, lint, format on save, mouse selection, copy, cut and paste. Claude can open the pane for you through the open tool.",
+  "author": {
+    "name": "zyx1121",
+    "url": "https://github.com/zyx1121"
+  },
+  "types": "./types/index.d.ts"
+}

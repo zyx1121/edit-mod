@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Typecheck
+        run: bunx -p typescript tsc -p tsconfig.json
+      - name: Install Claude Code
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Plugin tests
+        env:
+          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1"
+        run: ~/.local/bin/claude plugin test .
