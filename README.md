@@ -27,7 +27,7 @@ A small edit in your own hands is often faster than a prompt. A switch to anothe
 ## Features
 
 - **Open from a prompt**: say "I want to edit demo.ts", and Claude opens the pane with the `open` tool. `/edit <path>` does the same.
-- **Highlighting and lint**: the engine highlights the code. Lint errors mark the line number and show below the code.
+- **Highlighting and lint**: the engine highlights the code. A problem underlines its text in red for an error or yellow for a warning, colors the line number, and shows below the code.
 - **Language server**: errors appear as you type, with completion, hover, go to definition and rename. TypeScript, JavaScript, JSON and Markdown use `deno lsp`. Python uses basedpyright through `uvx`.
 - **Format on save**: `deno fmt` for JavaScript, TypeScript, JSON, CSS, Markdown, YAML and HTML. `ruff` for Python and `gofmt` for Go.
 - **macOS keys**: Cmd and Option with the arrows and Delete, Cmd+S, Cmd+X and Cmd+V.

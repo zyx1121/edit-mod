@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  applyEdits, applyTextEdits, backspace, dedent, findAll, mapSpot, move, newline, nextMatch, replaceRange, textIn, typeText,
+  applyEdits, applyTextEdits, backspace, dedent, diagnosticRange, findAll, mapSpot, move, newline, nextMatch, replaceRange,
+  textIn, typeText,
 } from '../hooks/editor/model'
 import { cells, colAt, wordAt } from '../hooks/editor/text'
 
@@ -85,4 +86,14 @@ test('text edits at one spot keep their order', async () => {
   const at = { row: 0, col: 1 }
   const lines = applyTextEdits(['ab'], [{ from: at, to: at, text: 'X' }, { from: at, to: at, text: 'Y' }])
   expect(lines).toEqual(['aXYb'])
+})
+
+test('a diagnostic covers its range, or the word at a point', async () => {
+  const lines = ['let unused = 1;']
+  expect(diagnosticRange(lines, { line: 1, col: 5, endLine: 1, endCol: 11, code: 'x', message: '' }))
+    .toEqual({ from: { row: 0, col: 4 }, to: { row: 0, col: 10 } })
+  expect(diagnosticRange(lines, { line: 1, col: 7, code: 'x', message: '' }))
+    .toEqual({ from: { row: 0, col: 4 }, to: { row: 0, col: 10 } })
+  expect(diagnosticRange(lines, { line: 1, col: 12, code: 'x', message: '' }))
+    .toEqual({ from: { row: 0, col: 11 }, to: { row: 0, col: 12 } })
 })

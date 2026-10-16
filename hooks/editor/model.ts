@@ -1,7 +1,8 @@
 // The editing model: carets with optional selections over an array of lines.
 // Every edit is a range replacement, so one or many carets take the same path.
 
-import { split, wordLeft, wordRight } from './text'
+import type { Diagnostic } from '../../types'
+import { split, wordAt, wordLeft, wordRight } from './text'
 
 export type Spot = { row: number; col: number }
 
@@ -238,6 +239,18 @@ export function move(lines: readonly string[], caret: Caret, motion: Motion, pag
   const anchor = isExtending ? (caret.anchor ?? { row, col }) : undefined
 
   return anchor ? { ...spot, anchor } : spot
+}
+
+// The text a diagnostic covers; a point widens to the word there, or one character
+export function diagnosticRange(lines: readonly string[], d: Diagnostic): Range {
+  const from = clamp(lines, { row: d.line - 1, col: d.col - 1 })
+  const to = clamp(lines, { row: (d.endLine ?? d.line) - 1, col: (d.endCol ?? d.col) - 1 })
+  if (compare(to, from) > 0) return { from, to }
+  const line = lines[from.row] ?? ''
+  const [start, end] = wordAt(line, from.col)
+  if (end > start) return { from: { row: from.row, col: start }, to: { row: from.row, col: end } }
+
+  return { from, to: { row: from.row, col: Math.min(line.length, from.col + 1) } }
 }
 
 // Search
