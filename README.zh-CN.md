@@ -29,7 +29,7 @@
 ## 功能
 
 - **用 prompt 打开文件**：说「我要改 demo.ts」，Claude 就用 `open` 工具打开 pane。`/edit <路径>` 也可以。
-- **高亮与 lint**：引擎负责语法高亮。lint 错误会标红行号，并列在代码下方。
+- **高亮与 lint**：引擎负责语法高亮。有问题的文本会加下划线，错误是红色、警告是黄色，行号跟着变色，问题也列在代码下方。
 - **语言服务器**：边输入边出现错误，还有自动补全、hover、跳到定义、重命名。TypeScript、JavaScript、JSON、Markdown 用 `deno lsp`，Python 通过 `uvx` 用 basedpyright。
 - **保存时格式化**：JavaScript、TypeScript、JSON、CSS、Markdown、YAML、HTML 用 `deno fmt`，Python 用 `ruff`，Go 用 `gofmt`。
 - **macOS 按键**：Cmd 和 Option 搭配方向键与 Delete，还有 Cmd+S、Cmd+X、Cmd+V。

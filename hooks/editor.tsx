@@ -1,8 +1,8 @@
 import type { ClientKeyEvent, ClientModule, ClientSurface } from 'claude-code'
 
-import type { CompletionItem, Doc, EditorProps, EditorRequest, Op } from '../types'
+import type { CompletionItem, Diagnostic, Doc, EditorProps, EditorRequest, Op } from '../types'
 import {
-  applyEdits, applyTextEdits, backspace, clamp, compare, dedent, deleteForward, deleteWordBack, findAll, killToEnd,
+  applyEdits, applyTextEdits, backspace, clamp, compare, dedent, diagnosticRange, deleteForward, deleteWordBack, findAll, killToEnd,
   killToStart, merge, move, newline, nextMatch, rangeOf, textIn, typeText,
 } from './editor/model'
 import type { Caret, Edit, Motion, Range, Spot } from './editor/model'
@@ -101,6 +101,13 @@ function typedText(k: ClientKeyEvent): string {
 
   return isText ? k.key : ''
 }
+
+// The theme colour a diagnostic draws in, by how bad it is
+function severityColor(d: Diagnostic): string {
+  return d.severity === 'warning' ? 'warning' : d.severity === 'info' ? 'suggestion' : 'error'
+}
+
+const SEVERITY_RANK = { error: 3, warning: 2, info: 1 } as const
 
 function primary(state: State): Caret {
   return state.carets[0] ?? { row: 0, col: 0 }
@@ -739,7 +746,12 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   const top = Math.min(state.top, Math.max(0, state.lines.length - 1))
   const end = Math.min(state.lines.length, top + rows)
   const width = String(state.lines.length).length
-  const errorLines = new Set(state.doc.diagnostics.map(d => d.line))
+  // The worst diagnostic on each line colours its number
+  const worst = new Map<number, Diagnostic>()
+  for (const d of state.doc.diagnostics) {
+    const held = worst.get(d.line)
+    if (!held || SEVERITY_RANK[d.severity ?? 'error'] > SEVERITY_RANK[held.severity ?? 'error']) worst.set(d.line, d)
+  }
   const room = Math.max(4, (s.columns || 60) - width - 2)
   const first = primary(state)
   const caretRows = new Set(state.carets.map(caret => caret.row))
@@ -747,9 +759,9 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   const gutter = []
   for (let i = top; i < end; i++) {
     const n = String(i + 1).padStart(width)
-    const isError = errorLines.has(i + 1)
+    const marked = worst.get(i + 1)
     gutter.push(
-      <Text color={isError ? 'error' : undefined} dimColor={!isError} bold={caretRows.has(i)}>
+      <Text color={marked ? severityColor(marked) : undefined} dimColor={!marked} bold={caretRows.has(i)}>
         {n}
       </Text>,
     )
@@ -792,14 +804,18 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
     parts.push(block(top, end))
   }
 
-  const overlay = (row: number, left: number, text: string, isMatch = false) => (
+  // A terminal has no wavy underline, so a diagnostic is an underline in its colour
+  type Paint = { kind: 'match' } | { kind: 'select' } | { kind: 'squiggle'; color: string }
+  const overlay = (row: number, left: number, text: string, paint: Paint) => (
     <Box position="absolute" top={row - top} left={left} height={1}>
-      {isMatch
+      {paint.kind === 'match'
         ? <Text backgroundColor={MATCH_BACKGROUND} wrap="truncate-end">{text}</Text>
+        : paint.kind === 'squiggle'
+        ? <Text color={paint.color} underline wrap="truncate-end">{text}</Text>
         : <Text inverse wrap="truncate-end">{text}</Text>}
     </Box>
   )
-  const paint = (range: Range, isMatch: boolean) => {
+  const paint = (range: Range, how: Paint) => {
     for (let i = Math.max(top, range.from.row); i <= Math.min(end - 1, range.to.row); i++) {
       if (isShifted && i === first.row) continue
       const line = state.lines[i] ?? ''
@@ -807,22 +823,26 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
       const to = i === range.to.row ? range.to.col : line.length
       const text = show(line.slice(from, to)) + (i === range.to.row ? '' : ' ')
       const left = cells(line.slice(0, from))
-      if (text !== '' && left < room) parts.push(overlay(i, left, text, isMatch))
+      if (text !== '' && left < room) parts.push(overlay(i, left, text, how))
     }
   }
   const matches = findMatches(state)
-  for (const match of matches) if (match.to.row >= top && match.from.row < end) paint(match, true)
+  for (const match of matches) if (match.to.row >= top && match.from.row < end) paint(match, { kind: 'match' })
+  for (const d of state.doc.diagnostics) {
+    if (d.line - 1 > end || (d.endLine ?? d.line) - 1 < top) continue
+    paint(diagnosticRange(state.lines, d), { kind: 'squiggle', color: severityColor(d) })
+  }
   for (const caret of state.carets) {
     const range = rangeOf(caret)
     if (range) {
-      paint(range, false)
+      paint(range, { kind: 'select' })
       continue
     }
     const isVisible = caret.row >= top && caret.row < end && !(isShifted && caret.row === first.row)
     const line = state.lines[caret.row] ?? ''
     const left = cells(line.slice(0, caret.col))
     const under = line[caret.col]
-    if (isVisible && left < room) parts.push(overlay(caret.row, left, under === undefined ? ' ' : show(under)))
+    if (isVisible && left < room) parts.push(overlay(caret.row, left, under === undefined ? ' ' : show(under), { kind: 'select' }))
   }
 
   // The completion list sits under the caret, or above it near the bottom
