@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
-  applyEdits, backspace, dedent, findAll, mapSpot, move, newline, nextMatch, replaceRange, textIn, typeText,
+  applyEdits, applyTextEdits, backspace, dedent, findAll, mapSpot, move, newline, nextMatch, replaceRange, textIn, typeText,
 } from '../hooks/editor/model'
 import { cells, colAt, wordAt } from '../hooks/editor/text'
 
@@ -79,4 +79,10 @@ test('wide characters take 2 cells', async () => {
   expect(cells('a中b')).toBe(4)
   expect(colAt('a中b', 3)).toBe(2)
   expect(wordAt('const 中文 = 1', 7)).toEqual([6, 8])
+})
+
+test('text edits at one spot keep their order', async () => {
+  const at = { row: 0, col: 1 }
+  const lines = applyTextEdits(['ab'], [{ from: at, to: at, text: 'X' }, { from: at, to: at, text: 'Y' }])
+  expect(lines).toEqual(['aXYb'])
 })

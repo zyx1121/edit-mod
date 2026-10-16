@@ -30,6 +30,7 @@
 
 - **用 prompt 開檔**：說「我要改 demo.ts」，Claude 就用 `open` 工具打開 pane。`/edit <路徑>` 也可以。
 - **高亮與 lint**：引擎負責語法高亮。lint 錯誤會標紅行號，並列在程式碼下方。
+- **語言伺服器**：邊打邊出現錯誤，還有自動補全、hover、跳到定義、重新命名。TypeScript、JavaScript、JSON、Markdown 用 `deno lsp`，Python 透過 `uvx` 用 basedpyright。
 - **存檔時格式化**：JavaScript、TypeScript、JSON、CSS、Markdown、YAML、HTML 用 `deno fmt`，Python 用 `ruff`，Go 用 `gofmt`。
 - **macOS 按鍵**：Cmd 和 Option 搭配方向鍵與 Delete，還有 Cmd+S、Cmd+X、Cmd+V。
 - **搜尋取代**：Ctrl+F 打開搜尋列，標出所有符合的地方，可以取代一個或全部。
@@ -67,6 +68,10 @@ export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
 | Ctrl+F | 打開或關閉搜尋列 |
 | Option+D | 選字，再把下一個符合處加成游標 |
 | Option+點擊 | 加一個游標 |
+| Up、Down、Tab 或 Enter | 選擇並接受補全 |
+| F12、Ctrl+點擊 | 跳到定義 |
+| F2 | 重新命名，所有用到的檔案一起改 |
+| 滑鼠停住 | 顯示底下的型別和錯誤 |
 | Cmd+Left、Cmd+Right | 跳到行首或行尾 |
 | Option+Left、Option+Right | 跳一個字 |
 | Cmd+Delete、Option+Delete | 刪到行首、刪一個字 |
@@ -91,6 +96,7 @@ keybind = cmd+x=text:\x1bx
 ## 運作方式
 
 - `hooks/register.tsx` 註冊 `/edit` 和 `open` 工具，負責讀寫檔案，每次存檔時跑格式化和 lint。
+- `bridge/lsp.ts` 是一支 Bun 小程式，在 Unix socket 上替語言伺服器當前台。mod 只能一次寫完子程序的 stdin，所以 hooks 用 `$.http.fetch` 呼叫它，錯誤推送從它的 stdout 回來。
 - `hooks/editor.tsx` 是 `Client` surface module。它保存文字、游標、選取和復原紀錄，只畫看得到的行。
 - 編輯器把每次修改用小的範圍操作送給 hooks，hooks 保留一份同步的文字。存檔只送文字的雜湊值，對不上時編輯器會把全文重送一次。
 - 開檔時全文每批 60000 字元送進編輯器，因為引擎限制每則訊息 100000 字元。
@@ -99,7 +105,8 @@ keybind = cmd+x=text:\x1bx
 ## 限制
 
 - 檔案上限 4 MiB，是引擎一次能讀的最大量。1 MB 的檔案大約 2 秒開好。
-- lint 在存檔時跑，不會邊打邊跑。目前沒有自動補全。
+- 只有語言伺服器支援的檔案會邊打邊 lint，其他檔案在存檔時 lint。
+- 重新命名會直接把其他被改到的檔案寫回磁碟。編輯器的復原只會還原開著的檔案。
 - Cmd+Z 留給 Ghostty，它用來重開關掉的分頁。Claude Code 會先攔走 Ctrl+Z、Ctrl+D、Ctrl+C，所以復原用 Option+Z。
 
 ## 其他

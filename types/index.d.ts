@@ -21,7 +21,15 @@ export type Doc = {
   savedHash?: string
   diagnostics: Diagnostic[]
   status: string
+  // A language server takes this file: completion, hover, definition and rename
+  hasLsp?: boolean
+  // Where the caret starts, for a jump to a definition in another file
+  caret?: Spot
 }
+
+export type CompletionItem = { label: string; insert: string; detail?: string; from?: Spot; to?: Spot }
+
+export type TextEdit = { from: Spot; to: Spot; text: string }
 
 // A change to the text: replace `from`..`to` with `text`, or start from nothing
 export type Op = { from: Spot; to: Spot; text: string } | { reset: true }
@@ -32,7 +40,18 @@ export type Paste = { seq: number; text: string }
 
 // The answer to the editor's request `seq`. A chunk names how many pieces the
 // text has, and `isDirty` when the hooks served unsaved text
-export type Reply = { seq: number; chunk?: string; count?: number; isDirty?: true; isStale?: true }
+export type Reply = {
+  seq: number
+  chunk?: string
+  count?: number
+  isDirty?: true
+  isStale?: true
+  completion?: { row: number; col: number; items: CompletionItem[] }
+  hover?: { row: number; col: number; text: string }
+  jump?: Spot
+  edits?: TextEdit[]
+  note?: string
+}
 
 export type EditorProps = Doc & { isFocused?: boolean; wheel?: Wheel; paste?: Paste; reply?: Reply }
 
@@ -40,6 +59,8 @@ export type EditorProps = Doc & { isFocused?: boolean; wheel?: Wheel; paste?: Pa
 export type EditorRequest =
   | { type: 'sync'; seq: number; base: number; ops: Op[]; more?: true; save?: string; isActive: true }
   | { type: 'chunk'; seq: number; rev: number; index: number }
+  | { type: 'complete' | 'hover' | 'definition'; seq: number; row: number; col: number }
+  | { type: 'rename'; seq: number; row: number; col: number; name: string }
 
 declare module 'claude-code' {
   interface PluginState {
