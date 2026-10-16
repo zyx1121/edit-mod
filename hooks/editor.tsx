@@ -498,6 +498,8 @@ function answered(state: State, props: EditorProps): State {
   const base = { ...state, pending: undefined }
   // An answer about the file before a switch only frees the request slot
   if (pending.path !== state.doc.path) return { ...base, renaming: undefined }
+  // A failed request leaves the text as it is and unsaved; a failed download stops
+  if (reply.isFailed) return { ...base, note: reply.note, renaming: undefined, loading: undefined }
   if (request.type === 'chunk') {
     const loading = state.loading
     if (!loading || loading.rev !== request.rev || reply.chunk === undefined) return base

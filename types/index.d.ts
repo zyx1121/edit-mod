@@ -46,6 +46,8 @@ export type Reply = {
   count?: number
   isDirty?: true
   isStale?: true
+  // The request failed in the hooks; `note` says why
+  isFailed?: true
   completion?: { row: number; col: number; items: CompletionItem[] }
   hover?: { row: number; col: number; text: string }
   jump?: Spot

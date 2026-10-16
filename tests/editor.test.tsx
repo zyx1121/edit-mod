@@ -80,3 +80,35 @@ test('saves only on Cmd+S or leaving the pane, formats, and lints', async ($, on
   expect(formatted[1]).toContain('x')
   await ui.unmount()
 })
+
+test('a save that fails says so, stays unsaved, and the editor keeps working', async ($, on) => {
+  let isWritable = false
+  const writes: string[] = []
+  mock.env(on, { HOME: '/home' })
+  on('session.root', () => ({ value: '/proj' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.read', () => ({ value: 'abc' }))
+  on('fs.write', ($, e) => {
+    if (!isWritable) return { deny: 'EACCES: permission denied' } as never
+    writes.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } as never }))
+  on('process.run', () => ({
+    value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+
+  await $.command.run({ command: 'edit', args: 'a.txt', presentation: { isFullscreen: true, columns: 160 } } as never)
+  const ui = await $.ui.mount({ plugin: 'edit-mod', surface: 'terminal', component: 'Pane', requestId: 'editor', props: PANE_PROPS as never })
+  await ui.resize({ columns: 60, rows: 12, in: 'editor' })
+
+  await ui.key({ key: 'x', in: 'editor' })
+  await ui.key({ key: 's', meta: true, in: 'editor' })
+  expect(await ui.find({ in: 'editor', text: /failed: .*EACCES/ })).toBeDefined()
+
+  isWritable = true
+  await ui.key({ key: 'y', in: 'editor' })
+  await ui.key({ key: 's', meta: true, in: 'editor' })
+  expect(writes).toEqual(['xyabc'])
+  await ui.unmount()
+})
