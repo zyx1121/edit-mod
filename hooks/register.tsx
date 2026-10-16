@@ -6,7 +6,10 @@ import { applyTextEdits } from './editor/model'
 import { applyOps, PIECE } from './editor/sync'
 import { split } from './editor/text'
 import { hashText } from './hash'
-import { editsByPath, hasLsp, hoverText, isLspOpen, lspChange, lspOpen, lspReplace, lspRequest, lspSave, pathOf, toItems } from './lsp'
+import {
+  editsByPath, hasLsp, hoverText, isKnown, isLspOpen, lspChange, lspOpen, lspReplace, lspRequest, lspRetire, lspSave, lspTell,
+  pathOf, toItems,
+} from './lsp'
 import type { LspRange } from './lsp'
 import { byPlace, lspDiagnostics } from './state'
 
@@ -242,6 +245,7 @@ async function openFile($: EngineInterface, typed: string, caret?: Spot): Promis
   }
 
   const prev = await read($, doc)
+  if (prev && prev.path !== path) lspRetire(prev.path)
   const rev = (prev?.rev ?? 0) + 1
   const diagnostics = exists ? await check($, path, []) : []
   hold(path, rev, text)
@@ -296,15 +300,20 @@ async function answerChunk($: EngineInterface, seq: number, rev: number, index: 
 
 type SyncRequest = Extract<EditorRequest, { type: 'sync' }>
 
-async function answerSync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
-  // A resend of the request in progress waits for its answer
-  if (running && running.seq === data.seq) return running.done
-  if (data.seq <= lastSeq) return propsFor($, { seq: data.seq })
-  lastSeq = data.seq
-  const done = applySync($, data)
-  running = { seq: data.seq, done }
+// A request runs once: a resend of the one in progress waits for its answer,
+// and a resend of an older one gets a bare answer
+async function gated($: EngineInterface, seq: number, work: () => Promise<EditorProps | undefined>): Promise<EditorProps | undefined> {
+  if (running && running.seq === seq) return running.done
+  if (seq <= lastSeq) return propsFor($, { seq })
+  lastSeq = seq
+  const done = work()
+  running = { seq, done }
 
   return done
+}
+
+async function answerSync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
+  return gated($, data.seq, () => applySync($, data))
 }
 
 async function applySync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
@@ -368,19 +377,40 @@ async function answerLsp(
   }
 
   if (data.type !== 'rename') return propsFor($, { seq: data.seq })
-  // A rename edits the open file in the editor and the other files on disk
-  const result = await lspRequest($, path, 'textDocument/rename', { position, newName: data.name })
-  const edits = editsByPath(result)
-  if (edits.size === 0) return propsFor($, { seq: data.seq, note: 'nothing to rename' })
-  let others = 0
-  for (const [file, list] of edits) {
+  // A rename edits the open file in the editor and the other files on disk. The
+  // server's view of another file can be old (an earlier rename, Claude, git), so
+  // each file it names gets its disk text first, and the rename is asked again
+  const params = { position, newName: data.name }
+  const found = editsByPath(await lspRequest($, path, 'textDocument/rename', params))
+  if (found.size === 0) return propsFor($, { seq: data.seq, note: 'nothing to rename' })
+  const texts = new Map<string, string>()
+  for (const file of found.keys()) {
     if (file === path) continue
     const text = await $.fs.read(file).catch(() => undefined)
     if (text === undefined) continue
-    await $.fs.write(file, applyTextEdits(split(text), list).join('\n'))
+    texts.set(file, text)
+    await lspTell($, file, text)
+  }
+  const edits = editsByPath(await lspRequest($, path, 'textDocument/rename', params))
+  let others = 0
+  let skipped = 0
+  for (const [file, list] of edits) {
+    if (file === path) continue
+    const text = texts.get(file)
+    // A file the server named only now, or one that changed since it was read, stays as it is
+    const now = await $.fs.read(file).catch(() => undefined)
+    if (text === undefined || now !== text) {
+      skipped++
+      continue
+    }
+    const eol = text.includes('\r\n') ? '\r\n' : '\n'
+    const next = applyTextEdits(split(text), list).join(eol)
+    await $.fs.write(file, next)
+    await lspTell($, file, next)
     others++
   }
-  const note = others > 0 ? `renamed in ${others + 1} files` : 'renamed'
+  const renamed = others > 0 ? `renamed in ${others + 1} files` : 'renamed'
+  const note = skipped > 0 ? `${renamed}, ${skipped} skipped: they changed, rename again` : renamed
 
   return propsFor($, { seq: data.seq, edits: edits.get(path) ?? [], note })
 }
@@ -441,7 +471,7 @@ export const register: Register = on => {
       : data.type === 'sync'
       ? await answerSync($, data)
       : data.type === 'complete' || data.type === 'hover' || data.type === 'definition' || data.type === 'rename'
-      ? await answerLsp($, data)
+      ? await gated($, data.seq, () => answerLsp($, data))
       : undefined
 
     return props ? { props } : next(e)
@@ -485,6 +515,11 @@ export const register: Register = on => {
     const result = await next(e)
     if (e.tool === 'Edit' || e.tool === 'Write') {
       await reload($, e.file_path).catch(() => undefined)
+      // Keep the server's view of the other files it holds current
+      if (isKnown(e.file_path)) {
+        const text = await $.fs.read(e.file_path).catch(() => undefined)
+        if (text !== undefined) await lspTell($, e.file_path, text)
+      }
     }
 
     return result

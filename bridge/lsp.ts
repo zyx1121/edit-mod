@@ -41,6 +41,7 @@ type Waiter = { resolve: (value: Json) => void; reject: (error: Error) => void }
 
 type Server = {
   spec: Spec
+  kill: () => void
   write: (message: Json) => void
   request: (method: string, params: Json) => Promise<Json>
   ready: Promise<boolean>
@@ -185,7 +186,7 @@ function start(spec: Spec): Server {
     })
     .catch(() => false)
 
-  return { spec, write, request, ready, versions: new Map() }
+  return { spec, kill: () => child.kill(), write, request, ready, versions: new Map() }
 }
 
 async function serverFor(path: string): Promise<{ server: Server; uri: string; languageId: string } | undefined> {
@@ -200,7 +201,12 @@ async function serverFor(path: string): Promise<{ server: Server; uri: string; l
     }
     servers.set(found.spec.id, server)
   }
-  if (!(await server.ready)) return undefined
+  // A server that did not start (a slow first download, say) is tried again next time
+  if (!(await server.ready)) {
+    if (servers.get(found.spec.id) === server) servers.delete(found.spec.id)
+    server.kill()
+    return undefined
+  }
 
   return { server, uri: pathToFileURL(path).href, languageId: found.languageId }
 }
@@ -266,14 +272,22 @@ Bun.serve({
 
 emit({ type: 'ready' })
 
-// The hooks end the bridge by ending its process; the socket goes with it
-for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
-  process.on(signal, () => {
-    try {
-      unlinkSync(socket)
-    } catch {
-      // Already gone
-    }
-    process.exit(0)
-  })
+function shutdown(): never {
+  for (const server of servers.values()) server.kill()
+  try {
+    unlinkSync(socket)
+  } catch {
+    // Already gone
+  }
+  process.exit(0)
 }
+
+// The hooks end the bridge by ending its process; the socket goes with it
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(signal, shutdown)
+
+// When Claude Code dies without ending the bridge, the bridge gets a new parent:
+// it ends too, so no bun, deno or basedpyright process outlives the session
+const parent = process.ppid
+setInterval(() => {
+  if (process.ppid !== parent) shutdown()
+}, 2000)

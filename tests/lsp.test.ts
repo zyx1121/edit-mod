@@ -42,13 +42,15 @@ test('hover text drops code fences', async () => {
   expect(hoverText(undefined)).toBe('')
 })
 
-test('a rename groups its edits by file, from changes and documentChanges', async () => {
-  const edits = editsByPath({
+test('a rename groups its edits by file, documentChanges first', async () => {
+  const both = editsByPath({
     changes: { 'file:///w/a.ts': [{ range: range(0, 16, 21), newText: 'yell' }] },
     documentChanges: [{ textDocument: { uri: 'file:///w/b%20c.ts' }, edits: [{ range: range(2, 0, 5), newText: 'yell' }] }],
   })
-  expect([...edits.keys()]).toEqual(['/w/a.ts', '/w/b c.ts'])
-  expect(edits.get('/w/a.ts')).toEqual([{ from: { row: 0, col: 16 }, to: { row: 0, col: 21 }, text: 'yell' }])
+  // A server that sends both forms means the same edits: they apply once
+  expect([...both.keys()]).toEqual(['/w/b c.ts'])
+  const changes = editsByPath({ changes: { 'file:///w/a.ts': [{ range: range(0, 16, 21), newText: 'yell' }] } })
+  expect(changes.get('/w/a.ts')).toEqual([{ from: { row: 0, col: 16 }, to: { row: 0, col: 21 }, text: 'yell' }])
   expect(pathOf('file:///w/b%20c.ts')).toBe('/w/b c.ts')
 })
 

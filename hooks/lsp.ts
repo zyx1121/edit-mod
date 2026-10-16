@@ -25,6 +25,8 @@ let bridge: Bridge | undefined
 // Changes go to the bridge one after another, and a request waits for them
 let queue: Promise<unknown> = Promise.resolve()
 const opened = new Set<string>()
+// Other files the server holds open, with the text the hooks last gave it
+const known = new Set<string>()
 
 export function isLspOpen(path: string): boolean {
   return bridge !== undefined && opened.has(path)
@@ -99,6 +101,7 @@ async function run($: EngineInterface, socket: string, done: (isReady: boolean) 
     done(false)
     bridge = undefined
     opened.clear()
+    known.clear()
   }
 }
 
@@ -153,6 +156,30 @@ export function lspReplace($: EngineInterface, path: string, text: string): void
   const socket = bridge?.socket
   if (!socket || !opened.has(path)) return
   chain(() => call($, socket, '/change', { path, changes: [{ text }] }))
+}
+
+// The editor moved to another file: the server keeps the old one open, and
+// Claude's edits to it are passed on from now
+export function lspRetire(path: string): void {
+  if (!opened.delete(path)) return
+  known.add(path)
+}
+
+export function isKnown(path: string): boolean {
+  return known.has(path)
+}
+
+// Gives the server a file's text as it is now, and waits until it has it
+export async function lspTell($: EngineInterface, path: string, text: string): Promise<void> {
+  const socket = bridge?.socket
+  if (!socket || !hasLsp(path)) return
+  known.add(path)
+  await new Promise<void>(resolve => {
+    chain(async () => {
+      await call($, socket, '/open', { path, text }).catch(() => undefined)
+      resolve()
+    })
+  })
 }
 
 export function lspSave($: EngineInterface, path: string): void {
@@ -242,8 +269,12 @@ export function editsByPath(result: unknown): Map<string, TextEdit[]> {
     const path = pathOf(uri)
     found.set(path, [...(found.get(path) ?? []), ...edits.map(one => ({ ...fromLsp(one.range), text: one.newText }))])
   }
-  for (const [uri, edits] of Object.entries(edit.changes ?? {})) add(uri, edits)
-  for (const change of edit.documentChanges ?? []) if (change.textDocument && change.edits) add(change.textDocument.uri, change.edits)
+  // A server may send both forms of the same edit: documentChanges wins
+  if (edit.documentChanges) {
+    for (const change of edit.documentChanges) if (change.textDocument && change.edits) add(change.textDocument.uri, change.edits)
+  } else {
+    for (const [uri, edits] of Object.entries(edit.changes ?? {})) add(uri, edits)
+  }
 
   return found
 }

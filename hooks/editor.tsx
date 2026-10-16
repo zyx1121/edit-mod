@@ -64,6 +64,8 @@ type State = {
   completion?: Completion
   hover?: Hover
   rename?: { row: number; col: number; name: string }
+  // The text a rename was asked on: input waits until its answer comes
+  renaming?: string[]
   note?: string
 }
 
@@ -372,7 +374,8 @@ function lspKey(state: State, k: ClientKeyEvent): Outcome | undefined {
     if (F2.has(k.key)) return { state: { ...state, rename: undefined } }
     if (k.key === 'return' || k.key === 'enter') {
       if (rename.name === '') return { state: { ...state, rename: undefined } }
-      return { state: { ...state, rename: undefined, ask: { type: 'rename', row: rename.row, col: rename.col, name: rename.name } } }
+      const ask = { type: 'rename' as const, row: rename.row, col: rename.col, name: rename.name }
+      return { state: { ...state, rename: undefined, ask, renaming: state.lines, note: 'renaming' } }
     }
     if (k.key === 'backspace') return { state: { ...state, rename: { ...rename, name: rename.name.slice(0, -1) } } }
     const typed = typedText(k)
@@ -487,7 +490,7 @@ function answered(state: State, props: EditorProps): State {
   const request = pending.request
   const base = { ...state, pending: undefined }
   // An answer about the file before a switch only frees the request slot
-  if (pending.path !== state.doc.path) return base
+  if (pending.path !== state.doc.path) return { ...base, renaming: undefined }
   if (request.type === 'chunk') {
     const loading = state.loading
     if (!loading || loading.rev !== request.rev || reply.chunk === undefined) return base
@@ -526,9 +529,13 @@ function lspAnswered(state: State, request: EditorRequest, reply: NonNullable<Ed
   if (request.type === 'definition') {
     return reply.jump ? withCarets(noted, [clamp(state.lines, reply.jump)]) : noted
   }
-  if (request.type === 'rename' && reply.edits && reply.edits.length > 0) {
+  if (request.type === 'rename') {
+    const done = { ...noted, renaming: undefined }
+    if (!reply.edits || reply.edits.length === 0) return done
+    // The text moved under the rename (a change on disk): its ranges no longer fit
+    if (state.renaming !== state.lines) return { ...done, note: 'the text changed; rename again' }
     const lines = applyTextEdits(state.lines, reply.edits)
-    return { ...snap(noted), lines, carets: merge(state.carets.map(one => clamp(lines, one))), isDirty: true, redo: [] }
+    return { ...snap(done), lines, carets: merge(state.carets.map(one => clamp(lines, one))), isDirty: true, redo: [] }
   }
 
   return noted
@@ -626,7 +633,7 @@ function clicked(state: State, spot: Spot, isAdding: boolean, isExtending: boole
 function start(s: Surface, doc: Doc): State {
   s.onKey(k => {
     const current = s.state
-    if (!current || current.loading) return
+    if (!current || current.loading || current.renaming) return
     const rows = editRows(s, current)
     const viaLsp = lspKey(current, k)
     const out = viaLsp ?? handle(current, k, rows - 1)
@@ -690,6 +697,7 @@ function start(s: Surface, doc: Doc): State {
     const rows = editRows(s, current)
     const spot = spotAt(current, e.x, e.y)
     if (e.type === 'down') {
+      if (current.renaming) return
       s.post({ type: 'active', isActive: true })
       const placed = { ...clicked(current, spot, e.alt === true, e.shift === true), completion: undefined, hover: undefined, rename: undefined }
       // Ctrl+click goes to the definition, as Cmd+click does in VS Code
@@ -717,7 +725,7 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   if (doc.rev > state.doc.rev) state = follow(adopt(state, doc), editRows(s, state))
   else if (isNewDoc && doc.rev === state.doc.rev) state = { ...state, doc }
   if (wheel && wheel.seq > state.wheelSeq) state = { ...scrollBy(state, wheel.by), wheelSeq: wheel.seq }
-  if (pasted && pasted.seq > state.pasteSeq && !state.loading) {
+  if (pasted && pasted.seq > state.pasteSeq && !state.loading && !state.renaming) {
     state = { ...follow(paste(state, pasted.text), editRows(s, state)), pasteSeq: pasted.seq }
   }
   if (isFocused !== undefined && isFocused !== state.wasFocused) {

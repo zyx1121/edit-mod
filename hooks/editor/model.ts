@@ -121,7 +121,10 @@ export function merge(carets: readonly Caret[]): Caret[] {
 
 // Applies edits that all refer to the same text, as a language server sends them
 export function applyTextEdits(lines: readonly string[], edits: readonly (Range & { text: string })[]): string[] {
-  const ordered = [...edits].sort((a, b) => compare(b.from, a.from))
+  // Last first, so earlier positions hold; of 2 inserts at one spot the later one goes first
+  const ordered = edits.map((one, index) => ({ one, index }))
+    .sort((a, b) => compare(b.one.from, a.one.from) || b.index - a.index)
+    .map(entry => entry.one)
   let next = lines.slice()
   for (const one of ordered) next = replaceRange(next, clamp(next, one.from), clamp(next, one.to), one.text).lines
 
