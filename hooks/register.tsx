@@ -1,18 +1,36 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Diagnostic, Doc } from '../types'
+import type { Diagnostic, Doc, EditorProps, EditorRequest, Reply } from '../types'
+import { applyOps, PIECE } from './editor/sync'
+import { split } from './editor/text'
 import { hashText } from './hash'
 
 const PANE = 'editor'
-const MAX_CHARS = 90_000
 const doc = atom({ plugin: 'edit-mod', key: 'doc' } as const, null)
 const wheel = atom({ plugin: 'edit-mod', key: 'wheel' } as const, { seq: 0, by: 0 })
 
 const paste = atom({ plugin: 'edit-mod', key: 'paste' } as const, { seq: 0, text: '' })
 
-// The editor's latest unsaved text, saved when the pane closes or the session ends
-let draft: string | undefined
+// The hooks' copy of the editor's text, kept current by the editor's ops on
+// version `rev`. A change larger than one post comes in several requests, so
+// `whole` is the mirror after the last request with no more pieces behind it:
+// that is what a save, a pane close, a prompt submit or a session end writes.
+type Mirror = { path: string; rev: number; lines: string[] }
+let mirror: Mirror | undefined
+let whole: Mirror | undefined
+let isMirrorDirty = false
+let isWholeDirty = false
+// A change is still coming in pieces: `mirror` is ahead of `whole`
+let isUploading = false
+// The text of the current `rev` as the hooks read or wrote it, for downloads
+let content: { rev: number; text: string } | undefined
+// What a download serves, fixed at its first piece
+let serving: { rev: number; text: string; isDirty: boolean } | undefined
+// The last sync request taken: a resent one gets the same answer, never a second apply
+let lastSeq = 0
+let running: { seq: number; done: Promise<EditorProps | undefined> } | undefined
+let lastFocused: boolean | undefined
 // Whether the person is working in the editor: clicked or typed into it and has
 // not typed into the prompt since. A paste then belongs to the editor.
 let isEditorActive = false
@@ -25,7 +43,7 @@ const NO_COLOR = { NO_COLOR: '1' }
 const DENO_LINT = new Set(['ts', 'tsx', 'js', 'jsx', 'mts', 'mjs', 'cts', 'cjs'])
 
 type Tooled = { text: string; diagnostics: Diagnostic[] }
-type EditorMessage = { type: 'save' | 'draft' | 'copy' | 'active'; text?: string; isActive?: boolean }
+type EditorMessage = EditorRequest | { type: 'copy' | 'active'; text?: string; isActive?: boolean }
 
 function extOf(path: string): string {
   const name = path.slice(path.lastIndexOf('/') + 1)
@@ -128,54 +146,90 @@ async function check($: EngineInterface, path: string, extra: Diagnostic[]): Pro
   return found.sort((a, b) => a.line - b.line || a.col - b.col).slice(0, 200)
 }
 
+function docFor(path: string, rev: number, text: string, diagnostics: Diagnostic[], status: string, savedHash?: string): Doc {
+  return {
+    path,
+    rev,
+    size: text.length,
+    hash: hashText(text),
+    chunks: Math.max(1, Math.ceil(text.length / PIECE)),
+    ...(savedHash === undefined ? {} : { savedHash }),
+    diagnostics,
+    status,
+  }
+}
+
+// The hooks hold `text` as version `rev` of `path`
+function hold(path: string, rev: number, text: string): void {
+  content = { rev, text }
+  mirror = { path, rev, lines: split(text) }
+  whole = mirror
+  isMirrorDirty = false
+  isWholeDirty = false
+  isUploading = false
+}
+
+async function propsFor($: EngineInterface, reply?: Reply): Promise<EditorProps | undefined> {
+  const current = await read($, doc)
+  if (!current) return undefined
+
+  return {
+    ...current,
+    ...(lastFocused === undefined ? {} : { isFocused: lastFocused }),
+    wheel: await read($, wheel),
+    paste: await read($, paste),
+    ...(reply ? { reply } : {}),
+  }
+}
+
+async function saveWhole($: EngineInterface): Promise<void> {
+  const current = await read($, doc)
+  if (!current || !whole || whole.path !== current.path) return
+
+  const posted = whole.lines.join('\n')
+  const formatted = await format($, current.path, posted)
+  await $.fs.write(current.path, formatted.text)
+  const diagnostics = await check($, current.path, formatted.diagnostics)
+  const status = formatted.text !== posted ? 'saved, formatted' : 'saved'
+  const rev = current.rev + 1
+  hold(current.path, rev, formatted.text)
+  await update($, doc, () => docFor(current.path, rev, formatted.text, diagnostics, status, hashText(posted)))
+}
+
+const SETTLE_MS = 2000
+
+// Saves the unsaved text before the pane closes, a prompt goes out, the session
+// ends or another file opens. A change still coming in pieces gets SETTLE_MS to
+// land. Past that nothing is written: half a change, or the text from before
+// it, is worse than the file as it was.
 async function flush($: EngineInterface): Promise<void> {
-  if (draft === undefined) return
-  const text = draft
-  draft = undefined
-  await save($, text)
+  for (let waited = 0; isUploading && waited < SETTLE_MS; waited += 50) await $.clock.sleep(50)
+  if (isUploading) {
+    $.ui.toast('edit-mod: a large change was still arriving, so the file was not saved')
+    return
+  }
+  if (isWholeDirty) await saveWhole($)
 }
 
 async function openFile($: EngineInterface, typed: string): Promise<string> {
   await flush($)
   const path = await absolute($, typed)
   const exists = await $.fs.exists(path)
-  const text = exists ? await $.fs.read(path) : ''
-  if (text.length > MAX_CHARS) return `${typed} has ${text.length} characters; the editor holds ${MAX_CHARS}.`
+  let text = ''
+  try {
+    text = exists ? await $.fs.read(path) : ''
+  } catch (error) {
+    return `${typed} cannot be opened: ${String(error)}`
+  }
 
   const prev = await read($, doc)
+  const rev = (prev?.rev ?? 0) + 1
   const diagnostics = exists ? await check($, path, []) : []
-  await update($, doc, () => ({
-    path,
-    text,
-    rev: (prev?.rev ?? 0) + 1,
-    diagnostics,
-    status: exists ? 'opened' : 'new file',
-  }))
+  hold(path, rev, text)
+  await update($, doc, () => docFor(path, rev, text, diagnostics, exists ? 'opened' : 'new file'))
   await $.ui.open({ id: PANE, title: path.slice(path.lastIndexOf('/') + 1), focus: true })
 
   return `Editing ${path}. Click the pane to type; Esc returns the keyboard.`
-}
-
-async function save($: EngineInterface, posted: string): Promise<Doc | undefined> {
-  const current = await read($, doc)
-  if (!current) return undefined
-  draft = undefined
-
-  const formatted = await format($, current.path, posted)
-  await $.fs.write(current.path, formatted.text)
-  const diagnostics = await check($, current.path, formatted.diagnostics)
-  const changed = formatted.text !== posted
-  const next: Doc = {
-    path: current.path,
-    text: formatted.text,
-    rev: current.rev + 1,
-    savedHash: hashText(posted),
-    diagnostics,
-    status: changed ? 'saved, formatted' : 'saved',
-  }
-  await update($, doc, () => next)
-
-  return next
 }
 
 async function reload($: EngineInterface, path: string): Promise<void> {
@@ -183,16 +237,79 @@ async function reload($: EngineInterface, path: string): Promise<void> {
   if (!current || current.path !== path) return
 
   const text = await $.fs.read(path).catch(() => undefined)
-  if (text === undefined || text === current.text) return
+  if (text === undefined || hashText(text) === current.hash) return
+  // Unsaved edits win over the change on disk until the next save
+  if (isMirrorDirty || isWholeDirty) {
+    await update($, doc, last => (last ? { ...last, status: 'changed on disk' } : last))
+    return
+  }
 
   const diagnostics = await check($, path, [])
-  await update($, doc, () => ({
-    path,
-    text,
-    rev: current.rev + 1,
-    diagnostics,
-    status: 'changed on disk',
-  }))
+  const rev = current.rev + 1
+  hold(path, rev, text)
+  await update($, doc, () => docFor(path, rev, text, diagnostics, 'changed on disk'))
+}
+
+// A download serves the unsaved whole text when there is one, so an editor that
+// starts again (a reload of its module) picks up where the person was
+async function answerChunk($: EngineInterface, seq: number, rev: number, index: number): Promise<EditorProps | undefined> {
+  const current = await read($, doc)
+  if (!current || current.rev !== rev) return propsFor($, { seq })
+  if (index === 0 || serving?.rev !== rev) {
+    const hasUnsaved = isWholeDirty && whole !== undefined && whole.path === current.path && whole.rev === rev
+    if (hasUnsaved) {
+      mirror = whole
+      isMirrorDirty = true
+      serving = { rev, text: whole!.lines.join('\n'), isDirty: true }
+    } else {
+      if (content?.rev !== rev) hold(current.path, rev, await $.fs.read(current.path).catch(() => ''))
+      serving = { rev, text: content?.text ?? '', isDirty: false }
+    }
+  }
+  const text = serving.text
+  const count = Math.max(1, Math.ceil(text.length / PIECE))
+  const chunk = text.slice(index * PIECE, (index + 1) * PIECE)
+
+  return propsFor($, { seq, chunk, count, ...(serving.isDirty ? { isDirty: true as const } : {}) })
+}
+
+type SyncRequest = Extract<EditorRequest, { type: 'sync' }>
+
+async function answerSync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
+  // A resend of the request in progress waits for its answer
+  if (running && running.seq === data.seq) return running.done
+  if (data.seq <= lastSeq) return propsFor($, { seq: data.seq })
+  lastSeq = data.seq
+  const done = applySync($, data)
+  running = { seq: data.seq, done }
+
+  return done
+}
+
+async function applySync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
+  const stale = () => propsFor($, { seq: data.seq, isStale: true })
+  const current = await read($, doc)
+  const first = data.ops[0]
+  const isFresh = first !== undefined && 'reset' in first
+  // Ops apply only to the mirror of the version they were made on
+  const isOurs = mirror !== undefined && mirror.path === current?.path && mirror.rev === data.base
+  if (!current || data.base !== current.rev || (!isOurs && !isFresh)) return stale()
+
+  const lines = applyOps(isOurs ? mirror!.lines : [''], data.ops)
+  if (!lines) return stale()
+  mirror = { path: current.path, rev: current.rev, lines }
+  if (data.ops.length > 0) isMirrorDirty = true
+  isUploading = data.more === true
+  if (!data.more) {
+    whole = mirror
+    isWholeDirty = isMirrorDirty
+  }
+  if (data.save !== undefined) {
+    if (data.more || hashText(lines.join('\n')) !== data.save) return stale()
+    await saveWhole($)
+  }
+
+  return propsFor($, { seq: data.seq })
 }
 
 export const register: Register = on => {
@@ -240,22 +357,17 @@ export const register: Register = on => {
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     const data = e.data as EditorMessage | undefined
     if (!data) return next(e)
-    if (typeof data.isActive === 'boolean') isEditorActive = data.isActive
+    if ('isActive' in data && typeof data.isActive === 'boolean') isEditorActive = data.isActive
     if (data.type === 'active') return {}
-    if (typeof data.text !== 'string') return next(e)
     if (data.type === 'copy') {
-      await $.ui.copy({ text: data.text, surface: e.surface })
+      if (typeof data.text === 'string') await $.ui.copy({ text: data.text, surface: e.surface })
       return {}
     }
-    if (data.type === 'draft') {
-      draft = data.text
-      return {}
-    }
-    if (data.type !== 'save') return next(e)
+    const props = data.type === 'chunk'
+      ? await answerChunk($, data.seq, data.rev, data.index)
+      : data.type === 'sync' ? await answerSync($, data) : undefined
 
-    const saved = await save($, data.text)
-
-    return saved ? { props: saved } : {}
+    return props ? { props } : next(e)
   })
 
   on('ui.scroll', { requestId: PANE }, async ($, e) => {
@@ -308,12 +420,8 @@ export const register: Register = on => {
     if (!current) return <Text dimColor>/edit &lt;path&gt;</Text>
 
     const rows = Math.max(6, e.props.scroll.bodyRows)
-    const props = {
-      ...current,
-      isFocused: e.props.isFocused,
-      wheel: await read($, wheel),
-      paste: await read($, paste),
-    }
+    lastFocused = e.props.isFocused
+    const props = await propsFor($)
 
     return (
       <Box flexDirection="column" height={rows}>
