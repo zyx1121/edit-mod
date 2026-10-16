@@ -119,6 +119,15 @@ export function merge(carets: readonly Caret[]): Caret[] {
   })
 }
 
+// Applies edits that all refer to the same text, as a language server sends them
+export function applyTextEdits(lines: readonly string[], edits: readonly (Range & { text: string })[]): string[] {
+  const ordered = [...edits].sort((a, b) => compare(b.from, a.from))
+  let next = lines.slice()
+  for (const one of ordered) next = replaceRange(next, clamp(next, one.from), clamp(next, one.to), one.text).lines
+
+  return next
+}
+
 // Edits that each caret applies for itself
 
 export function typeText(text: string) {

@@ -14,6 +14,9 @@ Claude Code mod (a function-hooks plugin). `hooks/register.tsx` exports `registe
 - Draw the caret and the selection as `position="absolute"` overlays on the `Code` run, so the caret line keeps its colors. Count cells with `cells()`, because wide characters take 2 cells.
 - Every edit is a range replacement per caret in `hooks/editor/model.ts`. Add a new edit as a `make` function for `applyEdits`, so it works with many carets. Test it in `tests/model.test.ts`.
 - Claude Code takes Ctrl+C, Ctrl+D and Ctrl+Z before a `Client` sees them, and a terminal sends Ctrl+H as Backspace. Do not bind them. Option keys arrive as `meta`.
+- The language servers sit behind `bridge/lsp.ts`. `hooks/lsp.ts` starts it, forwards every applied op to it in order, and maps its shapes to the editor's. Test the bridge with `bun bridge/smoke.ts`.
+- The engine passes `$` only to a function declared at the top of a file or imported from the mod, never to a callback. A `read` or `update` takes an atom declared in the same file, so `hooks/state.ts` declares `doc` again under the same address.
+- A function key reaches a `Client` as its raw escape sequence (F2 is `\u001bOQ`). A terminal can fold several typed characters into one key, so text fields take the whole `k.key`.
 - Strip ANSI escapes and control characters from tool output before it goes into a tree.
 - `types/claude-code.d.ts` is the engine contract. Copy it, do not edit it.
 - Repository documents and code comments are English. No em dashes.

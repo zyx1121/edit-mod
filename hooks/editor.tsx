@@ -1,13 +1,13 @@
 import type { ClientKeyEvent, ClientModule, ClientSurface } from 'claude-code'
 
-import type { Doc, EditorProps, EditorRequest, Op } from '../types'
+import type { CompletionItem, Doc, EditorProps, EditorRequest, Op } from '../types'
 import {
-  applyEdits, backspace, clamp, compare, dedent, deleteForward, deleteWordBack, findAll, killToEnd,
+  applyEdits, applyTextEdits, backspace, clamp, compare, dedent, deleteForward, deleteWordBack, findAll, killToEnd,
   killToStart, merge, move, newline, nextMatch, rangeOf, textIn, typeText,
 } from './editor/model'
 import type { Caret, Edit, Motion, Range, Spot } from './editor/model'
 import { batch, diffOps, fullTextOps, mapCarets } from './editor/sync'
-import { cells, colAt, indentUnit, show, split, wordAt } from './editor/text'
+import { cells, colAt, indentUnit, isWordChar, show, split, wordAt } from './editor/text'
 import { hashText } from './hash'
 
 type Snapshot = { lines: string[]; carets: Caret[] }
@@ -25,6 +25,15 @@ type Click = { at: number; row: number; col: number; count: number }
 type Pending = { request: EditorRequest; sentAt: number; isSave: boolean; path: string }
 
 type Loading = { rev: number; count: number; parts: string[]; index: number }
+
+// A language server request waiting to go out; the latest one wins
+type Ask =
+  | { type: 'complete' | 'hover' | 'definition'; row: number; col: number }
+  | { type: 'rename'; row: number; col: number; name: string }
+
+type Completion = { row: number; col: number; items: CompletionItem[]; index: number }
+
+type Hover = { row: number; col: number; text: string }
 
 type State = {
   lines: string[]
@@ -51,6 +60,11 @@ type State = {
   seq: number
   pending?: Pending
   loading?: Loading
+  ask?: Ask
+  completion?: Completion
+  hover?: Hover
+  rename?: { row: number; col: number; name: string }
+  note?: string
 }
 
 type Surface = ClientSurface<State>
@@ -65,18 +79,33 @@ const WHEEL_ROWS = 3
 const UNDO_DEPTH = 100
 const CLICK_MS = 400
 const RESEND_MS = 1500
+const HOVER_MS = 600
+const POPUP_BACKGROUND = '#1f2430'
+const POPUP_ROWS = 8
+// Function keys reach a Client as their raw escape sequences
+const F2 = new Set(['\u001bOQ', '\u001b[12~'])
+const F12 = new Set(['\u001b[24~'])
 const NAMED = new Set([
   'up', 'down', 'left', 'right', 'return', 'enter', 'tab', 'backspace', 'delete',
   'pageup', 'pagedown', 'home', 'end', 'escape', 'insert',
 ])
 const CLOSED_FIND: Find = { isOpen: false, hasKeys: false, field: 'query', query: '', replace: '' }
 
+// What a key adds to a text field: a terminal can fold several typed characters
+// into one key, and a function key arrives as its escape sequence
+function typedText(k: ClientKeyEvent): string {
+  if (k.key === 'space') return ' '
+  const isText = !k.ctrl && !k.meta && !NAMED.has(k.key) && !/[\u0000-\u001f\u007f]/.test(k.key)
+
+  return isText ? k.key : ''
+}
+
 function primary(state: State): Caret {
   return state.carets[0] ?? { row: 0, col: 0 }
 }
 
-function editRows(s: Surface, state: { doc: Doc; find?: Find }): number {
-  const shown = Math.min(3, state.doc.diagnostics.length) + (state.find?.isOpen ? 1 : 0)
+function editRows(s: Surface, state: { doc: Doc; find?: Find; rename?: unknown }): number {
+  const shown = Math.min(3, state.doc.diagnostics.length) + (state.find?.isOpen ? 1 : 0) + (state.rename ? 1 : 0)
 
   return Math.max(1, (s.rows || 20) - 1 - shown)
 }
@@ -223,11 +252,11 @@ function findKey(state: State, k: ClientKeyEvent): State {
 
     return goToMatch(state, k.shift === true)
   }
-  if (k.key === 'backspace') return set(value.slice(0, -1))
   if (k.meta && k.key === 'backspace') return set('')
-  if (k.key === 'space') return set(value + ' ')
-  if (k.ctrl || k.meta || NAMED.has(k.key)) return state
-  const next = set(value + k.key)
+  if (k.key === 'backspace') return set(value.slice(0, -1))
+  const typed = typedText(k)
+  if (typed === '') return state
+  const next = set(value + typed)
 
   // Typing in the query searches again from the start of the current match
   const from = rangeOf(primary(next))?.from ?? primary(next)
@@ -299,9 +328,97 @@ function handle(state: State, k: ClientKeyEvent, page: number): Outcome {
     case 'tab': return { state: edit(state, k.shift ? dedent(unit) : typeText(unit)) }
     case 'space': return { state: edit(state, typeText(' ')) }
   }
-  if (NAMED.has(k.key) || k.meta) return { state }
+  // A key the engine did not name (a function key, say) arrives as its escape sequence
+  if (NAMED.has(k.key) || k.meta || /[\u0000-\u001f\u007f]/.test(k.key)) return { state }
 
   return { state: edit(state, typeText(k.key)) }
+}
+
+// Language server features
+
+function wordStart(line: string, col: number): number {
+  let start = col
+  while (start > 0 && isWordChar(line[start - 1])) start--
+
+  return start
+}
+
+function shownItems(state: State): CompletionItem[] {
+  const completion = state.completion
+  if (!completion) return []
+  const caret = primary(state)
+  const prefix = (state.lines[caret.row] ?? '').slice(completion.col, caret.col).toLowerCase()
+  if (prefix === '') return completion.items
+
+  return completion.items.filter(item => item.label.toLowerCase().startsWith(prefix))
+}
+
+function accept(state: State, item: CompletionItem): State {
+  const completion = state.completion
+  if (!completion) return state
+  const caret = primary(state)
+  const from = { row: completion.row, col: completion.col }
+  const replaced = edit(withCarets(state, [{ row: caret.row, col: caret.col, anchor: from }]), typeText(item.insert))
+
+  return { ...replaced, completion: undefined }
+}
+
+// Keys for the completion list, the rename bar and the function keys; undefined
+// lets the editor handle the key as usual
+function lspKey(state: State, k: ClientKeyEvent): Outcome | undefined {
+  const caret = primary(state)
+  if (state.rename) {
+    const rename = state.rename
+    if (F2.has(k.key)) return { state: { ...state, rename: undefined } }
+    if (k.key === 'return' || k.key === 'enter') {
+      if (rename.name === '') return { state: { ...state, rename: undefined } }
+      return { state: { ...state, rename: undefined, ask: { type: 'rename', row: rename.row, col: rename.col, name: rename.name } } }
+    }
+    if (k.key === 'backspace') return { state: { ...state, rename: { ...rename, name: rename.name.slice(0, -1) } } }
+    const typed = typedText(k)
+    return { state: typed !== '' ? { ...state, rename: { ...rename, name: rename.name + typed } } : state }
+  }
+  if (F12.has(k.key)) return { state: { ...state, ask: { type: 'definition', row: caret.row, col: caret.col } } }
+  if (F2.has(k.key)) {
+    const line = state.lines[caret.row] ?? ''
+    const [start, end] = wordAt(line, caret.col)
+    if (start === end || !state.doc.hasLsp) return { state }
+    return { state: { ...state, rename: { row: caret.row, col: start, name: line.slice(start, end) } } }
+  }
+  const items = shownItems(state)
+  if (state.completion && items.length > 0) {
+    const index = Math.min(state.completion.index, items.length - 1)
+    if (k.key === 'down' || k.key === 'up') {
+      const step = k.key === 'down' ? 1 : items.length - 1
+      return { state: { ...state, completion: { ...state.completion, index: (index + step) % items.length } } }
+    }
+    if (k.key === 'tab' || k.key === 'return' || k.key === 'enter') return { state: accept(state, items[index]!) }
+  }
+
+  return undefined
+}
+
+// After a key: open, keep or close the completion list as VS Code does
+function afterKey(before: State, state: State, k: ClientKeyEvent): State {
+  const next = { ...state, note: undefined, hover: undefined }
+  if (!next.doc.hasLsp || next.carets.length !== 1 || next.rename) return { ...next, completion: undefined }
+  // A terminal can fold several typed characters into one key: the last one counts
+  const typed = typedText(k).slice(-1)
+  const caret = primary(next)
+  const line = next.lines[caret.row] ?? ''
+  const isTyping = next.lines !== before.lines
+  const completion = next.completion
+  if (completion) {
+    const isKept = isTyping && caret.row === completion.row && caret.col >= completion.col &&
+      (isWordChar(typed) || k.key === 'backspace')
+    if (typed === '.') return { ...next, completion: undefined, ask: { type: 'complete', row: caret.row, col: caret.col } }
+
+    return isKept ? next : { ...next, completion: undefined }
+  }
+  const isWordStart = isWordChar(typed) && caret.col > wordStart(line, caret.col)
+  if (isTyping && (typed === '.' || isWordStart)) return { ...next, ask: { type: 'complete', row: caret.row, col: caret.col } }
+
+  return next
 }
 
 function save(state: State): State {
@@ -344,6 +461,12 @@ function pump(s: Surface, state: State): State {
       wantSave: isSave ? false : state.wantSave,
       ...(isSave ? { savingLines: state.lines } : {}),
     }
+  } else if (state.ask) {
+    // Typing goes on while earlier requests are out: complete where the caret is now
+    const caret = primary(state)
+    const ask = state.ask.type === 'complete' ? { ...state.ask, row: caret.row, col: caret.col } : state.ask
+    request = { ...ask, seq }
+    next = { ...state, ask: undefined }
   } else {
     return state
   }
@@ -380,9 +503,35 @@ function answered(state: State, props: EditorProps): State {
     // The hooks' copy went its own way: send the whole text again
     return { ...base, outbox: fullTextOps(state.lines), sent: state.lines, base: props.rev, wantSave: state.wantSave || pending.isSave }
   }
-  if (pending.isSave && state.lines === state.savingLines) return { ...base, isDirty: false }
+  if (request.type === 'sync') {
+    if (pending.isSave && state.lines === state.savingLines) return { ...base, isDirty: false }
+    return base
+  }
+  return lspAnswered(base, request, reply)
+}
 
-  return base
+function lspAnswered(state: State, request: EditorRequest, reply: NonNullable<EditorProps['reply']>): State {
+  const caret = primary(state)
+  const noted = reply.note ? { ...state, note: reply.note } : state
+  if (request.type === 'complete') {
+    const found = reply.completion
+    if (!found || found.items.length === 0 || caret.row !== found.row) return { ...noted, completion: undefined }
+    const col = wordStart(state.lines[caret.row] ?? '', Math.min(found.col, caret.col))
+
+    return { ...noted, completion: { row: found.row, col, items: found.items, index: 0 } }
+  }
+  if (request.type === 'hover') {
+    return reply.hover && state.hover?.row === reply.hover.row ? { ...noted, hover: reply.hover } : noted
+  }
+  if (request.type === 'definition') {
+    return reply.jump ? withCarets(noted, [clamp(state.lines, reply.jump)]) : noted
+  }
+  if (request.type === 'rename' && reply.edits && reply.edits.length > 0) {
+    const lines = applyTextEdits(state.lines, reply.edits)
+    return { ...snap(noted), lines, carets: merge(state.carets.map(one => clamp(lines, one))), isDirty: true, redo: [] }
+  }
+
+  return noted
 }
 
 function scrollBy(state: State, by: number): State {
@@ -479,23 +628,38 @@ function start(s: Surface, doc: Doc): State {
     const current = s.state
     if (!current || current.loading) return
     const rows = editRows(s, current)
-    const out = handle(current, k, rows - 1)
+    const viaLsp = lspKey(current, k)
+    const out = viaLsp ?? handle(current, k, rows - 1)
     // A copy goes out alone; the ops wait for the next key or redraw
     if (out.copy !== undefined) {
       s.post({ type: 'copy', text: out.copy, isActive: true })
       s.setState(follow(out.state, editRows(s, out.state)))
       return
     }
-    const next = out.isSave ? save(out.state) : out.state
+    // The completion list, the rename bar and the function keys took the key themselves
+    const next = viaLsp ? viaLsp.state : afterKey(current, out.isSave ? save(out.state) : out.state, k)
     s.setState(follow(sync(s, next), editRows(s, next)))
   })
+  // Where the pointer rests: a rest of HOVER_MS asks the language server once
+  let rest: { x: number; y: number; at: number; isAsked: boolean } | undefined
   // A post can be lost when another one replaces it in the same frame
   s.every(250, () => {
     const current = s.state
-    const pending = current?.pending
-    if (!current || !pending || Date.now() - pending.sentAt < RESEND_MS) return
-    s.post(pending.request)
-    s.setState({ ...current, pending: { ...pending, sentAt: Date.now() } })
+    if (!current) return
+    const pending = current.pending
+    if (pending && Date.now() - pending.sentAt >= RESEND_MS) {
+      s.post(pending.request)
+      s.setState({ ...current, pending: { ...pending, sentAt: Date.now() } })
+      return
+    }
+    if (!rest || rest.isAsked || Date.now() - rest.at < HOVER_MS || current.loading) return
+    rest.isAsked = true
+    const spot = spotAt(current, rest.x, rest.y)
+    const under = (current.lines[spot.row] ?? '')[spot.col]
+    if (under === undefined || /\s/.test(under)) return
+    const hover = { row: spot.row, col: spot.col, text: '' }
+    const ask: Ask | undefined = current.doc.hasLsp ? { type: 'hover', row: spot.row, col: spot.col } : undefined
+    s.setState(sync(s, { ...current, hover, ...(ask ? { ask } : {}) }))
   })
 
   s.onPointer(e => {
@@ -504,7 +668,16 @@ function start(s: Surface, doc: Doc): State {
     // No blur reaches a Client, so the pointer leaving the editor saves; the
     // editor stays the paste target until the person types into the prompt
     if (e.type === 'leave') {
-      if (current.isDirty) s.setState(sync(s, save(current)))
+      rest = undefined
+      const left = current.hover ? { ...current, hover: undefined } : current
+      if (current.isDirty) s.setState(sync(s, save(left)))
+      else if (left !== current) s.setState(left)
+      return
+    }
+    if (e.type === 'move' && !e.button) {
+      if (rest && rest.x === e.x && rest.y === e.y) return
+      rest = { x: e.x, y: e.y, at: Date.now(), isAsked: false }
+      if (current.hover) s.setState({ ...current, hover: undefined })
       return
     }
     if (e.type === 'up') {
@@ -518,7 +691,10 @@ function start(s: Surface, doc: Doc): State {
     const spot = spotAt(current, e.x, e.y)
     if (e.type === 'down') {
       s.post({ type: 'active', isActive: true })
-      s.setState(follow(clicked(current, spot, e.alt === true, e.shift === true), rows))
+      const placed = { ...clicked(current, spot, e.alt === true, e.shift === true), completion: undefined, hover: undefined, rename: undefined }
+      // Ctrl+click goes to the definition, as Cmd+click does in VS Code
+      const next = e.ctrl && current.doc.hasLsp ? { ...placed, ask: { type: 'definition' as const, row: spot.row, col: spot.col } } : placed
+      s.setState(follow(sync(s, next), rows))
       return
     }
     const first = primary(current)
@@ -533,7 +709,9 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   const { Box, Text, Code } = s.elements
   const { isFocused, wheel, paste: pasted, reply: _reply, ...doc } = props
   let state = s.state ?? start(s, doc)
+  const caretBefore = primary(state)
   state = answered(state, props)
+  if (compare(primary(state), caretBefore) !== 0) state = follow(state, editRows(s, state))
   // Props arrive as new objects on every redraw, so compare what they say
   const isNewDoc = JSON.stringify(doc) !== JSON.stringify(state.doc)
   if (doc.rev > state.doc.rev) state = follow(adopt(state, doc), editRows(s, state))
@@ -639,6 +817,56 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
     if (isVisible && left < room) parts.push(overlay(caret.row, left, under === undefined ? ' ' : show(under)))
   }
 
+  // The completion list sits under the caret, or above it near the bottom
+  const items = shownItems(state)
+  if (state.completion && items.length > 0 && first.row >= top && first.row < end) {
+    const index = Math.min(state.completion.index, items.length - 1)
+    const start = Math.max(0, Math.min(index - POPUP_ROWS + 1, items.length - POPUP_ROWS))
+    const visible = items.slice(start, start + POPUP_ROWS)
+    const widest = Math.max(...visible.map(item => cells(item.label) + (item.detail ? cells(item.detail) + 2 : 0)))
+    const popupWidth = Math.max(10, Math.min(room, widest + 2, 60))
+    const below = first.row - top + 1
+    const popupTop = below + visible.length <= rows ? below : Math.max(0, first.row - top - visible.length)
+    const left = Math.max(0, Math.min(cells((state.lines[first.row] ?? '').slice(0, state.completion.col)), room - popupWidth))
+    parts.push(
+      <Box position="absolute" top={popupTop} left={left} width={popupWidth} flexDirection="column" backgroundColor={POPUP_BACKGROUND}>
+        {visible.map((item, i) => (
+          <Text inverse={start + i === index} wrap="truncate-end">
+            {' '}{item.label}{item.detail ? <Text dimColor>  {item.detail}</Text> : ''}{' '}
+          </Text>
+        ))}
+      </Box>,
+    )
+  }
+
+  // The hover box: diagnostics at that spot, then what the language server says
+  const hover = state.hover
+  if (hover && hover.row >= top && hover.row < end) {
+    const at = { line: hover.row + 1, col: hover.col + 1 }
+    const here = state.doc.diagnostics.filter(d => {
+      const isAfterStart = at.line > d.line || (at.line === d.line && at.col >= d.col)
+      const endLine = d.endLine ?? d.line
+      const endCol = d.endCol ?? d.col + 1
+      const isBeforeEnd = at.line < endLine || (at.line === endLine && at.col < Math.max(endCol, d.col + 1))
+      return isAfterStart && isBeforeEnd
+    })
+    const textLines = hover.text === '' ? [] : hover.text.split('\n').filter(line => line.trim() !== '')
+    const shown = [...here.map(d => ({ text: `${d.code ? d.code + ': ' : ''}${d.message.split('\n')[0]}`, color: d.severity === 'warning' ? 'warning' : d.severity === 'info' ? undefined : 'error' })),
+      ...textLines.map(text => ({ text, color: undefined }))].slice(0, 10)
+    if (shown.length > 0) {
+      const boxWidth = Math.max(10, Math.min(room, Math.max(...shown.map(line => cells(line.text))) + 2))
+      const above = hover.row - top - shown.length
+      const boxTop = above >= 0 ? above : hover.row - top + 1
+      const line = state.lines[hover.row] ?? ''
+      const left = Math.max(0, Math.min(cells(line.slice(0, hover.col)), room - boxWidth))
+      parts.push(
+        <Box position="absolute" top={boxTop} left={left} width={boxWidth} flexDirection="column" backgroundColor={POPUP_BACKGROUND}>
+          {shown.map(one => <Text color={one.color} wrap="truncate-end"> {one.text}</Text>)}
+        </Box>,
+      )
+    }
+  }
+
   const near = state.doc.diagnostics.find(d => d.line === first.row + 1)
   const listed = [
     ...(near ? [near] : []),
@@ -682,13 +910,18 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
           </Text>
         </Box>
       )}
+      {state.rename && (
+        <Box flexDirection="row" gap={2} height={1}>
+          {field('Rename', state.rename.name, true)}
+        </Box>
+      )}
       {listed.map(d => (
-        <Text color="error" wrap="truncate-end">
-          {d.line}:{d.col} {d.code} {d.message}
+        <Text color={d.severity === 'warning' ? 'warning' : d.severity === 'info' ? undefined : 'error'} dimColor={d.severity === 'info'} wrap="truncate-end">
+          {d.line}:{d.col} {d.code} {d.message.split('\n')[0]}
         </Text>
       ))}
       <Text dimColor wrap="truncate-end">
-        {name}  {first.row + 1}:{first.col + 1}{carets}  {mark}  {count === 0 ? 'no problems' : `${count} problems`}
+        {name}  {first.row + 1}:{first.col + 1}{carets}  {state.note ?? mark}  {count === 0 ? 'no problems' : `${count} problems`}
       </Text>
     </Box>
   )

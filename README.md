@@ -28,6 +28,7 @@ A small edit in your own hands is often faster than a prompt. A switch to anothe
 
 - **Open from a prompt**: say "I want to edit demo.ts", and Claude opens the pane with the `open` tool. `/edit <path>` does the same.
 - **Highlighting and lint**: the engine highlights the code. Lint errors mark the line number and show below the code.
+- **Language server**: errors appear as you type, with completion, hover, go to definition and rename. TypeScript, JavaScript, JSON and Markdown use `deno lsp`. Python uses basedpyright through `uvx`.
 - **Format on save**: `deno fmt` for JavaScript, TypeScript, JSON, CSS, Markdown, YAML and HTML. `ruff` for Python and `gofmt` for Go.
 - **macOS keys**: Cmd and Option with the arrows and Delete, Cmd+S, Cmd+X and Cmd+V.
 - **Find and replace**: Ctrl+F opens a find bar. It highlights every match and replaces one or all.
@@ -65,6 +66,10 @@ Start a new session and run `/edit <path>`. Click the pane to type. Esc gives th
 | Ctrl+F | Open or close the find bar |
 | Option+D | Select the word, then add the next match as a caret |
 | Option+click | Add a caret |
+| Up, Down, Tab or Enter | Pick and take a completion |
+| F12, Ctrl+click | Go to the definition |
+| F2 | Rename the symbol, in every file that uses it |
+| Rest the pointer | Show the type and the errors under it |
 | Cmd+Left, Cmd+Right | Go to the start or end of the line |
 | Option+Left, Option+Right | Go one word |
 | Cmd+Delete, Option+Delete | Delete to the line start, delete one word |
@@ -89,6 +94,7 @@ Cmd+S and Cmd+X then send Option+S and Option+X in every program.
 ## How it works
 
 - `hooks/register.tsx` registers `/edit` and the `open` tool, reads and writes the file, and runs the formatter and the linter on each save.
+- `bridge/lsp.ts` is a small Bun server on a Unix socket in front of the language servers. A mod can write a child's stdin only once, so the hooks call the bridge with `$.http.fetch`, and the bridge sends diagnostics back on its stdout.
 - `hooks/editor.tsx` is a `Client` surface module. It holds the text, the carets, the selections and the undo history. It draws only the visible lines.
 - The editor sends each change to the hooks as small range ops, and the hooks keep a copy of the text. A save sends only a hash of the text. When the hash does not match, the editor sends the whole text again.
 - An open file comes to the editor in pieces of 60000 characters, because the engine limits a message to 100000 characters.
@@ -97,7 +103,8 @@ Cmd+S and Cmd+X then send Option+S and Option+X in every program.
 ## Limits
 
 - A file has a limit of 4 MiB, the most that the engine reads at once. A 1 MB file opens in about 2 seconds.
-- Lint runs on save, not as you type. There is no completion yet.
+- Lint runs as you type only where a language server takes the file. Other files lint on save.
+- A rename writes the other files that it changes to disk at once. Undo in the editor reverts only the open file.
 - Cmd+Z stays with Ghostty, which uses it to reopen a closed tab. Claude Code takes Ctrl+Z, Ctrl+D and Ctrl+C before the editor sees them, so undo is Option+Z.
 
 ## For AI agents
@@ -112,13 +119,14 @@ Facts for coding agents and LLM tools. The rules for changing the code are in [A
 - **Verify**: `bunx -p typescript tsc -p tsconfig.json && CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude plugin test .`
 - **Config**: none
 - **Secrets**: none
-- **Limits**: 4 MiB a file. Formatters `deno`, `uvx ruff` and `gofmt` must be on the PATH.
+- **Limits**: 4 MiB a file. `bun` runs the LSP bridge. Formatters and servers `deno`, `uvx` and `gofmt` must be on the PATH.
 
 ## Development
 
 ```sh
 bunx -p typescript tsc -p tsconfig.json                    # typecheck
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude plugin test .   # the engine's test harness
+bun bridge/smoke.ts                                         # the LSP bridge against deno lsp
 ```
 
 `types/claude-code.d.ts` is the engine contract that Claude Code writes for mods. When the engine changes, copy the new version and let the typecheck show what moved.

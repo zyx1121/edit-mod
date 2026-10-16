@@ -1,15 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Diagnostic, Doc, EditorProps, EditorRequest, Reply } from '../types'
+import type { CompletionItem, Diagnostic, Doc, EditorProps, EditorRequest, Reply, Spot, TextEdit } from '../types'
+import { applyTextEdits } from './editor/model'
 import { applyOps, PIECE } from './editor/sync'
 import { split } from './editor/text'
 import { hashText } from './hash'
+import { editsByPath, hasLsp, hoverText, isLspOpen, lspChange, lspOpen, lspReplace, lspRequest, lspSave, pathOf, toItems } from './lsp'
+import type { LspRange } from './lsp'
+import { byPlace, lspDiagnostics } from './state'
 
 const PANE = 'editor'
+// The engine reads a state address only from a constant in the file that uses it,
+// so hooks/state.ts declares `doc` again under the same address
 const doc = atom({ plugin: 'edit-mod', key: 'doc' } as const, null)
 const wheel = atom({ plugin: 'edit-mod', key: 'wheel' } as const, { seq: 0, by: 0 })
-
 const paste = atom({ plugin: 'edit-mod', key: 'paste' } as const, { seq: 0, text: '' })
 
 // The hooks' copy of the editor's text, kept current by the editor's ops on
@@ -60,7 +65,7 @@ function firstLine(text: string): string {
 }
 
 async function absolute($: EngineInterface, path: string): Promise<string> {
-  const home = $.env.get('HOME') ?? ''
+  const home = (await $.env.get('HOME')) ?? ''
   const expanded = path.startsWith('~/') ? home + path.slice(1) : path
   if (expanded.startsWith('/')) return expanded
   const root = await $.session.root()
@@ -141,15 +146,27 @@ async function lint($: EngineInterface, path: string): Promise<Diagnostic[]> {
 }
 
 async function check($: EngineInterface, path: string, extra: Diagnostic[]): Promise<Diagnostic[]> {
-  const found = [...extra, ...(await lint($, path))]
+  // A language server already lints as you type; the command line linters are the fallback
+  const linted = isLspOpen(path) ? (lspDiagnostics.get(path) ?? []) : await lint($, path)
+  const found = [...extra, ...linted]
 
   return found.sort((a, b) => a.line - b.line || a.col - b.col).slice(0, 200)
 }
 
-function docFor(path: string, rev: number, text: string, diagnostics: Diagnostic[], status: string, savedHash?: string): Doc {
+function docFor(
+  path: string,
+  rev: number,
+  text: string,
+  diagnostics: Diagnostic[],
+  status: string,
+  savedHash?: string,
+  caret?: Spot,
+): Doc {
   return {
     path,
     rev,
+    hasLsp: hasLsp(path),
+    ...(caret ? { caret } : {}),
     size: text.length,
     hash: hashText(text),
     chunks: Math.max(1, Math.ceil(text.length / PIECE)),
@@ -189,6 +206,8 @@ async function saveWhole($: EngineInterface): Promise<void> {
   const posted = whole.lines.join('\n')
   const formatted = await format($, current.path, posted)
   await $.fs.write(current.path, formatted.text)
+  if (formatted.text !== posted) lspReplace($, current.path, formatted.text)
+  lspSave($, current.path)
   const diagnostics = await check($, current.path, formatted.diagnostics)
   const status = formatted.text !== posted ? 'saved, formatted' : 'saved'
   const rev = current.rev + 1
@@ -211,7 +230,7 @@ async function flush($: EngineInterface): Promise<void> {
   if (isWholeDirty) await saveWhole($)
 }
 
-async function openFile($: EngineInterface, typed: string): Promise<string> {
+async function openFile($: EngineInterface, typed: string, caret?: Spot): Promise<string> {
   await flush($)
   const path = await absolute($, typed)
   const exists = await $.fs.exists(path)
@@ -226,7 +245,8 @@ async function openFile($: EngineInterface, typed: string): Promise<string> {
   const rev = (prev?.rev ?? 0) + 1
   const diagnostics = exists ? await check($, path, []) : []
   hold(path, rev, text)
-  await update($, doc, () => docFor(path, rev, text, diagnostics, exists ? 'opened' : 'new file'))
+  await update($, doc, () => docFor(path, rev, text, diagnostics, exists ? 'opened' : 'new file', undefined, caret))
+  void lspOpen($, path, text)
   await $.ui.open({ id: PANE, title: path.slice(path.lastIndexOf('/') + 1), focus: true })
 
   return `Editing ${path}. Click the pane to type; Esc returns the keyboard.`
@@ -244,6 +264,7 @@ async function reload($: EngineInterface, path: string): Promise<void> {
     return
   }
 
+  lspReplace($, path, text)
   const diagnostics = await check($, path, [])
   const rev = current.rev + 1
   hold(path, rev, text)
@@ -299,6 +320,7 @@ async function applySync($: EngineInterface, data: SyncRequest): Promise<EditorP
   if (!lines) return stale()
   mirror = { path: current.path, rev: current.rev, lines }
   if (data.ops.length > 0) isMirrorDirty = true
+  lspChange($, current.path, data.ops)
   isUploading = data.more === true
   if (!data.more) {
     whole = mirror
@@ -310,6 +332,57 @@ async function applySync($: EngineInterface, data: SyncRequest): Promise<EditorP
   }
 
   return propsFor($, { seq: data.seq })
+}
+
+async function answerLsp(
+  $: EngineInterface,
+  data: Extract<EditorRequest, { type: 'complete' | 'hover' | 'definition' | 'rename' }>,
+): Promise<EditorProps | undefined> {
+  const current = await read($, doc)
+  if (!current) return propsFor($, { seq: data.seq })
+  const position = { line: data.row, character: data.col }
+  const path = current.path
+
+  if (data.type === 'complete') {
+    const result = await lspRequest($, path, 'textDocument/completion', { position, context: { triggerKind: 1 } })
+    return propsFor($, { seq: data.seq, completion: { row: data.row, col: data.col, items: toItems(result) } })
+  }
+  if (data.type === 'hover') {
+    const result = await lspRequest($, path, 'textDocument/hover', { position })
+    return propsFor($, { seq: data.seq, hover: { row: data.row, col: data.col, text: hoverText(result) } })
+  }
+  if (data.type === 'definition') {
+    const result = await lspRequest($, path, 'textDocument/definition', { position })
+    const first = (Array.isArray(result) ? result[0] : result) as
+      | { uri?: string; range?: LspRange; targetUri?: string; targetSelectionRange?: LspRange }
+      | undefined
+    const uri = first?.uri ?? first?.targetUri
+    const range = first?.range ?? first?.targetSelectionRange
+    if (!uri || !range) return propsFor($, { seq: data.seq, note: 'no definition found' })
+    const target = pathOf(uri)
+    const spot = { row: range.start.line, col: range.start.character }
+    if (target === path) return propsFor($, { seq: data.seq, jump: spot })
+    await openFile($, target, spot)
+
+    return propsFor($, { seq: data.seq })
+  }
+
+  if (data.type !== 'rename') return propsFor($, { seq: data.seq })
+  // A rename edits the open file in the editor and the other files on disk
+  const result = await lspRequest($, path, 'textDocument/rename', { position, newName: data.name })
+  const edits = editsByPath(result)
+  if (edits.size === 0) return propsFor($, { seq: data.seq, note: 'nothing to rename' })
+  let others = 0
+  for (const [file, list] of edits) {
+    if (file === path) continue
+    const text = await $.fs.read(file).catch(() => undefined)
+    if (text === undefined) continue
+    await $.fs.write(file, applyTextEdits(split(text), list).join('\n'))
+    others++
+  }
+  const note = others > 0 ? `renamed in ${others + 1} files` : 'renamed'
+
+  return propsFor($, { seq: data.seq, edits: edits.get(path) ?? [], note })
 }
 
 export const register: Register = on => {
@@ -365,7 +438,11 @@ export const register: Register = on => {
     }
     const props = data.type === 'chunk'
       ? await answerChunk($, data.seq, data.rev, data.index)
-      : data.type === 'sync' ? await answerSync($, data) : undefined
+      : data.type === 'sync'
+      ? await answerSync($, data)
+      : data.type === 'complete' || data.type === 'hover' || data.type === 'definition' || data.type === 'rename'
+      ? await answerLsp($, data)
+      : undefined
 
     return props ? { props } : next(e)
   })
