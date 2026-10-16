@@ -22,7 +22,7 @@ type Find = {
 
 type Click = { at: number; row: number; col: number; count: number }
 
-type Pending = { request: EditorRequest; sentAt: number; isSave: boolean }
+type Pending = { request: EditorRequest; sentAt: number; isSave: boolean; path: string }
 
 type Loading = { rev: number; count: number; parts: string[]; index: number }
 
@@ -333,6 +333,8 @@ function pump(s: Surface, state: State): State {
       seq,
       base: state.base,
       ops,
+      // The hooks write only a text whose pieces all came
+      ...(rest.length > 0 ? { more: true as const } : {}),
       ...(isSave ? { save: hashText(state.sent.join('\n')) } : {}),
       isActive: true,
     }
@@ -347,7 +349,7 @@ function pump(s: Surface, state: State): State {
   }
   s.post(request)
 
-  return { ...next, seq, pending: { request, sentAt: Date.now(), isSave } }
+  return { ...next, seq, pending: { request, sentAt: Date.now(), isSave, path: state.doc.path } }
 }
 
 function sync(s: Surface, state: State): State {
@@ -361,14 +363,18 @@ function answered(state: State, props: EditorProps): State {
   if (!pending || !reply || reply.seq !== pending.request.seq) return state
   const request = pending.request
   const base = { ...state, pending: undefined }
+  // An answer about the file before a switch only frees the request slot
+  if (pending.path !== state.doc.path) return base
   if (request.type === 'chunk') {
     const loading = state.loading
     if (!loading || loading.rev !== request.rev || reply.chunk === undefined) return base
     const parts = [...loading.parts, reply.chunk]
-    if (parts.length < loading.count) return { ...base, loading: { ...loading, parts, index: loading.index + 1 } }
+    const count = reply.count ?? loading.count
+    if (parts.length < count) return { ...base, loading: { ...loading, count, parts, index: loading.index + 1 } }
     const lines = split(parts.join(''))
+    const isDirty = reply.isDirty === true
 
-    return { ...base, ...reload(base, lines), sent: lines, outbox: [], base: loading.rev, loading: undefined, isDirty: false }
+    return { ...base, ...reload(base, lines), sent: lines, outbox: [], base: loading.rev, loading: undefined, isDirty }
   }
   if (reply.isStale) {
     // The hooks' copy went its own way: send the whole text again
@@ -422,10 +428,12 @@ function adopt(state: State, doc: Doc): State {
 
   const next = { ...state, doc }
   const textHash = hashText(state.lines.join('\n'))
-  if (doc.hash === textHash) return { ...next, base: doc.rev, sent: state.lines, outbox: [], loading: undefined }
-  const isOurSave = state.savingLines !== undefined && doc.savedHash === hashText(state.savingLines.join('\n'))
-  const isUntouched = state.lines === state.savingLines || !state.isDirty
-  if ((isOurSave && state.lines === state.savingLines) || isUntouched) {
+  if (doc.hash === textHash) {
+    return { ...next, base: doc.rev, sent: state.lines, outbox: [], loading: undefined, isDirty: false }
+  }
+  // A save wrote exactly this text (Cmd+S or a flush), or nothing is unsaved:
+  // take the new version, formatted or changed on disk
+  if (doc.savedHash === textHash || !state.isDirty) {
     return { ...next, outbox: [], loading: { rev: doc.rev, count: doc.chunks, parts: [], index: 0 } }
   }
 

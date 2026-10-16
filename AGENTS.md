@@ -6,6 +6,7 @@ Claude Code mod (a function-hooks plugin). `hooks/register.tsx` exports `registe
 
 - The editor holds the document. The hooks hold a mirror of it and the file on disk. They talk only through `ui.message` posts and `Client` props.
 - The sync is in `hooks/editor/sync.ts`. The editor sends `sync` requests with range ops and `chunk` requests for downloads. One request is out at a time, and the editor sends it again until the reply with its `seq` comes. A later post in the same frame replaces an earlier one, so never rely on a post without a reply.
+- A change larger than one post goes up in several `sync` requests marked `more`. The hooks write only `whole`, the mirror after a request without `more`. A flush waits up to 2 seconds for the last piece and writes nothing when it does not come: half a change, or the text from before it, is worse than the file as it was.
 - Props and posts have a limit of 100000 characters. Text moves in pieces of `PIECE`. Use `hashText` from `hooks/hash.ts` to name a text.
 - Compare props by content, not by reference: each redraw hands new objects, and a `setState` on every render unmounts the `Client`.
 - Save only on Cmd+S, when the pointer leaves the editor, on a prompt submit, on pane close and on session end. Do not add a timer.

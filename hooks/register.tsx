@@ -12,15 +12,24 @@ const wheel = atom({ plugin: 'edit-mod', key: 'wheel' } as const, { seq: 0, by: 
 
 const paste = atom({ plugin: 'edit-mod', key: 'paste' } as const, { seq: 0, text: '' })
 
-// The hooks' copy of the editor's text, kept current by the editor's ops. It is
-// what a save writes, also when the pane closes or the session ends.
+// The hooks' copy of the editor's text, kept current by the editor's ops on
+// version `rev`. A change larger than one post comes in several requests, so
+// `whole` is the mirror after the last request with no more pieces behind it:
+// that is what a save, a pane close, a prompt submit or a session end writes.
 type Mirror = { path: string; rev: number; lines: string[] }
 let mirror: Mirror | undefined
+let whole: Mirror | undefined
 let isMirrorDirty = false
+let isWholeDirty = false
+// A change is still coming in pieces: `mirror` is ahead of `whole`
+let isUploading = false
 // The text of the current `rev` as the hooks read or wrote it, for downloads
 let content: { rev: number; text: string } | undefined
-// The last sync request applied: a resent one is answered, not applied again
+// What a download serves, fixed at its first piece
+let serving: { rev: number; text: string; isDirty: boolean } | undefined
+// The last sync request taken: a resent one gets the same answer, never a second apply
 let lastSeq = 0
+let running: { seq: number; done: Promise<EditorProps | undefined> } | undefined
 let lastFocused: boolean | undefined
 // Whether the person is working in the editor: clicked or typed into it and has
 // not typed into the prompt since. A paste then belongs to the editor.
@@ -154,7 +163,10 @@ function docFor(path: string, rev: number, text: string, diagnostics: Diagnostic
 function hold(path: string, rev: number, text: string): void {
   content = { rev, text }
   mirror = { path, rev, lines: split(text) }
+  whole = mirror
   isMirrorDirty = false
+  isWholeDirty = false
+  isUploading = false
 }
 
 async function propsFor($: EngineInterface, reply?: Reply): Promise<EditorProps | undefined> {
@@ -170,11 +182,11 @@ async function propsFor($: EngineInterface, reply?: Reply): Promise<EditorProps 
   }
 }
 
-async function saveMirror($: EngineInterface): Promise<void> {
+async function saveWhole($: EngineInterface): Promise<void> {
   const current = await read($, doc)
-  if (!current || !mirror || mirror.path !== current.path) return
+  if (!current || !whole || whole.path !== current.path) return
 
-  const posted = mirror.lines.join('\n')
+  const posted = whole.lines.join('\n')
   const formatted = await format($, current.path, posted)
   await $.fs.write(current.path, formatted.text)
   const diagnostics = await check($, current.path, formatted.diagnostics)
@@ -184,8 +196,19 @@ async function saveMirror($: EngineInterface): Promise<void> {
   await update($, doc, () => docFor(current.path, rev, formatted.text, diagnostics, status, hashText(posted)))
 }
 
+const SETTLE_MS = 2000
+
+// Saves the unsaved text before the pane closes, a prompt goes out, the session
+// ends or another file opens. A change still coming in pieces gets SETTLE_MS to
+// land. Past that nothing is written: half a change, or the text from before
+// it, is worse than the file as it was.
 async function flush($: EngineInterface): Promise<void> {
-  if (isMirrorDirty) await saveMirror($)
+  for (let waited = 0; isUploading && waited < SETTLE_MS; waited += 50) await $.clock.sleep(50)
+  if (isUploading) {
+    $.ui.toast('edit-mod: a large change was still arriving, so the file was not saved')
+    return
+  }
+  if (isWholeDirty) await saveWhole($)
 }
 
 async function openFile($: EngineInterface, typed: string): Promise<string> {
@@ -216,7 +239,7 @@ async function reload($: EngineInterface, path: string): Promise<void> {
   const text = await $.fs.read(path).catch(() => undefined)
   if (text === undefined || hashText(text) === current.hash) return
   // Unsaved edits win over the change on disk until the next save
-  if (isMirrorDirty) {
+  if (isMirrorDirty || isWholeDirty) {
     await update($, doc, last => (last ? { ...last, status: 'changed on disk' } : last))
     return
   }
@@ -227,39 +250,63 @@ async function reload($: EngineInterface, path: string): Promise<void> {
   await update($, doc, () => docFor(path, rev, text, diagnostics, 'changed on disk'))
 }
 
+// A download serves the unsaved whole text when there is one, so an editor that
+// starts again (a reload of its module) picks up where the person was
 async function answerChunk($: EngineInterface, seq: number, rev: number, index: number): Promise<EditorProps | undefined> {
   const current = await read($, doc)
   if (!current || current.rev !== rev) return propsFor($, { seq })
-  if (content?.rev !== rev) {
-    const text = await $.fs.read(current.path).catch(() => '')
-    hold(current.path, rev, text)
+  if (index === 0 || serving?.rev !== rev) {
+    const hasUnsaved = isWholeDirty && whole !== undefined && whole.path === current.path && whole.rev === rev
+    if (hasUnsaved) {
+      mirror = whole
+      isMirrorDirty = true
+      serving = { rev, text: whole!.lines.join('\n'), isDirty: true }
+    } else {
+      if (content?.rev !== rev) hold(current.path, rev, await $.fs.read(current.path).catch(() => ''))
+      serving = { rev, text: content?.text ?? '', isDirty: false }
+    }
   }
-  const text = content?.text ?? ''
+  const text = serving.text
+  const count = Math.max(1, Math.ceil(text.length / PIECE))
+  const chunk = text.slice(index * PIECE, (index + 1) * PIECE)
 
-  return propsFor($, { seq, chunk: text.slice(index * PIECE, (index + 1) * PIECE) })
+  return propsFor($, { seq, chunk, count, ...(serving.isDirty ? { isDirty: true as const } : {}) })
 }
 
-async function answerSync(
-  $: EngineInterface,
-  data: Extract<EditorRequest, { type: 'sync' }>,
-): Promise<EditorProps | undefined> {
+type SyncRequest = Extract<EditorRequest, { type: 'sync' }>
+
+async function answerSync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
+  // A resend of the request in progress waits for its answer
+  if (running && running.seq === data.seq) return running.done
   if (data.seq <= lastSeq) return propsFor($, { seq: data.seq })
   lastSeq = data.seq
-  const stale = () => propsFor($, { seq: data.seq, isStale: true })
+  const done = applySync($, data)
+  running = { seq: data.seq, done }
 
+  return done
+}
+
+async function applySync($: EngineInterface, data: SyncRequest): Promise<EditorProps | undefined> {
+  const stale = () => propsFor($, { seq: data.seq, isStale: true })
   const current = await read($, doc)
   const first = data.ops[0]
   const isFresh = first !== undefined && 'reset' in first
-  const isOurs = mirror !== undefined && mirror.path === current?.path
+  // Ops apply only to the mirror of the version they were made on
+  const isOurs = mirror !== undefined && mirror.path === current?.path && mirror.rev === data.base
   if (!current || data.base !== current.rev || (!isOurs && !isFresh)) return stale()
 
   const lines = applyOps(isOurs ? mirror!.lines : [''], data.ops)
   if (!lines) return stale()
   mirror = { path: current.path, rev: current.rev, lines }
   if (data.ops.length > 0) isMirrorDirty = true
+  isUploading = data.more === true
+  if (!data.more) {
+    whole = mirror
+    isWholeDirty = isMirrorDirty
+  }
   if (data.save !== undefined) {
-    if (hashText(lines.join('\n')) !== data.save) return stale()
-    await saveMirror($)
+    if (data.more || hashText(lines.join('\n')) !== data.save) return stale()
+    await saveWhole($)
   }
 
   return propsFor($, { seq: data.seq })

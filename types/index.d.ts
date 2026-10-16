@@ -30,14 +30,15 @@ export type Wheel = { seq: number; by: number }
 
 export type Paste = { seq: number; text: string }
 
-// The answer to the editor's request `seq`
-export type Reply = { seq: number; chunk?: string; isStale?: true }
+// The answer to the editor's request `seq`. A chunk names how many pieces the
+// text has, and `isDirty` when the hooks served unsaved text
+export type Reply = { seq: number; chunk?: string; count?: number; isDirty?: true; isStale?: true }
 
 export type EditorProps = Doc & { isFocused?: boolean; wheel?: Wheel; paste?: Paste; reply?: Reply }
 
 // What the editor asks of the hooks; each request waits for its reply
 export type EditorRequest =
-  | { type: 'sync'; seq: number; base: number; ops: Op[]; save?: string; isActive: true }
+  | { type: 'sync'; seq: number; base: number; ops: Op[]; more?: true; save?: string; isActive: true }
   | { type: 'chunk'; seq: number; rev: number; index: number }
 
 declare module 'claude-code' {
