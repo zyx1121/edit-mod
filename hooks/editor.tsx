@@ -62,6 +62,13 @@ function cellWidth(ch: string): number {
   return /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1
 }
 
+function cells(text: string): number {
+  let used = 0
+  for (const ch of text) used += cellWidth(ch)
+
+  return used
+}
+
 function colAt(line: string, cells: number): number {
   let used = 0
   for (let i = 0; i < line.length; i++) {
@@ -510,46 +517,51 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   )
 
   const sel = selected(state)
-  const isSpecial = (i: number) => i === state.row || (sel !== undefined && i >= sel.from.row && i <= sel.to.row)
+  const caretLine = state.lines[state.row] ?? ''
+  const caretAt = cells(caretLine.slice(0, state.col))
+  // A caret past the right edge needs its line shifted, so that line alone is plain text
+  const isShifted = caretAt >= room - 1
+  const onScreen = state.row >= top && state.row < end
 
-  // One row drawn as plain text: the selection inverted, or the caret's cell
-  const plainRow = (i: number) => {
-    const line = state.lines[i] ?? ''
-    const shown = show(line)
-    if (sel && i >= sel.from.row && i <= sel.to.row) {
-      const text = shown + ' '
-      const from = i === sel.from.row ? showCol(line, sel.from.col) : 0
-      const to = i === sel.to.row ? showCol(line, sel.to.col) : text.length
-
-      return (
-        <Text wrap="truncate-end">
-          {text.slice(0, from)}
-          <Text inverse>{text.slice(from, to)}</Text>
-          {text.slice(to)}
-        </Text>
-      )
-    }
-    const at = showCol(line, state.col)
-    const shift = Math.max(0, at - room + 2)
-
-    return (
-      <Text wrap="truncate-end">
-        {shown.slice(shift, at)}
-        <Text inverse>{shown[at] ?? ' '}</Text>
-        {shown.slice(at + 1)}
-      </Text>
-    )
-  }
-
+  // Lines stay one highlighted Code run; the caret and the selection are drawn
+  // over it, so the caret line keeps its colours
   const parts = []
-  let run = top
-  for (let i = top; i < end; i++) {
-    if (!isSpecial(i)) continue
-    if (i > run) parts.push(block(run, i))
-    parts.push(<Box height={1} flexShrink={0}>{plainRow(i)}</Box>)
-    run = i + 1
+  if (isShifted && onScreen) {
+    const shown = show(caretLine)
+    const at = showCol(caretLine, state.col)
+    const shift = Math.max(0, at - room + 2)
+    if (state.row > top) parts.push(block(top, state.row))
+    parts.push(
+      <Box height={1} flexShrink={0}>
+        <Text wrap="truncate-end">
+          {shown.slice(shift, at)}
+          <Text inverse>{shown[at] ?? ' '}</Text>
+          {shown.slice(at + 1)}
+        </Text>
+      </Box>,
+    )
+    if (state.row + 1 < end) parts.push(block(state.row + 1, end))
+  } else if (end > top) {
+    parts.push(block(top, end))
   }
-  if (end > run) parts.push(block(run, end))
+
+  const overlay = (row: number, left: number, text: string) => (
+    <Box position="absolute" top={row - top} left={left} height={1}>
+      <Text inverse wrap="truncate-end">{text}</Text>
+    </Box>
+  )
+  if (sel) {
+    for (let i = Math.max(top, sel.from.row); i <= Math.min(end - 1, sel.to.row); i++) {
+      const line = state.lines[i] ?? ''
+      const from = i === sel.from.row ? sel.from.col : 0
+      const to = i === sel.to.row ? sel.to.col : line.length
+      const text = show(line.slice(from, to)) + (i === sel.to.row ? '' : ' ')
+      if (text !== '' && cells(line.slice(0, from)) < room) parts.push(overlay(i, cells(line.slice(0, from)), text))
+    }
+  } else if (onScreen && !isShifted) {
+    const under = caretLine[state.col]
+    parts.push(overlay(state.row, caretAt, under === undefined ? ' ' : show(under)))
+  }
 
   const first = state.doc.diagnostics.find(d => d.line === state.row + 1)
   const listed = [
@@ -565,7 +577,7 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
     <Box flexDirection="column" height={s.rows || undefined} backgroundColor={BACKGROUND}>
       <Box flexDirection="row" height={rows}>
         <Box flexDirection="column" width={width + 1}>{gutter}</Box>
-        <Box flexDirection="column" flexGrow={1}>
+        <Box flexDirection="column" flexGrow={1} position="relative">
           {parts}
         </Box>
       </Box>
