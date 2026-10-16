@@ -31,8 +31,10 @@
 - **用 prompt 打开文件**：说「我要改 demo.ts」，Claude 就用 `open` 工具打开 pane。`/edit <路径>` 也可以。
 - **高亮与 lint**：引擎负责语法高亮。lint 错误会标红行号，并列在代码下方。
 - **保存时格式化**：JavaScript、TypeScript、JSON、CSS、Markdown、YAML、HTML 用 `deno fmt`，Python 用 `ruff`，Go 用 `gofmt`。
-- **macOS 按键**：Cmd 和 Option 搭配方向键与 Delete，还有 Cmd+S、Cmd+X、Cmd+V。撤销是 Ctrl+Z。
-- **鼠标**：点击放置光标，拖动选择并复制，滚轮滚动。
+- **macOS 按键**：Cmd 和 Option 搭配方向键与 Delete，还有 Cmd+S、Cmd+X、Cmd+V。
+- **查找替换**：Ctrl+F 打开查找栏，标出所有匹配处，可以替换一个或全部。
+- **多光标**：Option+点击加一个光标。Option+D 把选中文本的下一个匹配处加为光标。
+- **鼠标**：点击放置光标，双击选词，三击选整行，拖动选择并复制，滚轮滚动。
 - **跟着 Claude**：Claude 改了打开的文件，pane 会重新加载。
 
 ## 快速开始
@@ -59,11 +61,18 @@ export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
 | Cmd+S | 保存并格式化 |
 | Cmd+X、Cmd+V | 剪切选区，粘贴到光标位置 |
 | 拖动、Shift 加方向键 | 选择。拖动会顺便复制 |
-| Ctrl+Z | 撤销 |
+| 双击、三击 | 选词、选整行 |
+| Option+Z | 撤销 |
+| Option+Shift+Z、Ctrl+Y | 重做 |
+| Ctrl+F | 打开或关闭查找栏 |
+| Option+D | 选词，再把下一个匹配处加为光标 |
+| Option+点击 | 加一个光标 |
 | Cmd+Left、Cmd+Right | 跳到行首或行尾 |
 | Option+Left、Option+Right | 跳一个词 |
 | Cmd+Delete、Option+Delete | 删到行首、删一个词 |
 | 滚轮 | 每格滚 3 行 |
+
+在查找栏输入要找的文本。Enter 跳到下一个，Shift+Enter 跳到上一个。Tab 切到替换栏，在那里按 Enter 替换一个，Option+Enter 全部替换。
 
 鼠标移出 pane、提交 prompt、关闭 pane、session 结束时也会保存。不会定时保存。
 
@@ -89,7 +98,7 @@ keybind = cmd+x=text:\x1bx
 
 - 文件上限 90000 字符，因为引擎限制每条消息 100000 字符。
 - lint 在保存时运行，不会边输入边运行。目前没有自动补全。
-- Cmd+Z 留给 Ghostty，它用来重新打开关掉的标签页。
+- Cmd+Z 留给 Ghostty，它用来重新打开关掉的标签页。Claude Code 会先拦下 Ctrl+Z、Ctrl+D、Ctrl+C，所以撤销用 Option+Z。
 
 ## 其他
 

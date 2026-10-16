@@ -1,375 +1,293 @@
 import type { ClientKeyEvent, ClientModule, ClientSurface } from 'claude-code'
 
 import type { Doc, EditorProps } from '../types'
+import {
+  applyEdits, backspace, clamp, compare, dedent, deleteForward, deleteWordBack, findAll, killToEnd,
+  killToStart, merge, move, newline, nextMatch, rangeOf, textIn, typeText,
+} from './editor/model'
+import type { Caret, Edit, Motion, Range, Spot } from './editor/model'
+import { cells, colAt, indentUnit, show, split, wordAt } from './editor/text'
 import { hashText } from './hash'
 
-type Snapshot = { lines: string[]; row: number; col: number }
+type Snapshot = { lines: string[]; carets: Caret[] }
 
-type Spot = { row: number; col: number }
+type Find = {
+  isOpen: boolean
+  hasKeys: boolean
+  field: 'query' | 'replace'
+  query: string
+  replace: string
+}
 
-type Selection = { from: Spot; to: Spot; text: string }
+type Click = { at: number; row: number; col: number; count: number }
 
 type State = {
   lines: string[]
-  row: number
-  col: number
+  // carets[0] is the primary caret: the view follows it and the status shows it
+  carets: Caret[]
   top: number
   rev: number
   isDirty: boolean
-  editedAt: number
   inflight?: string
   undo: Snapshot[]
+  redo: Snapshot[]
   snappedAt: number
   doc: Doc
   wasFocused: boolean
   wheelSeq: number
   pasteSeq: number
-  anchor?: Spot
+  find: Find
+  click?: Click
 }
 
 type Surface = ClientSurface<State>
 
+type Outcome = { state: State; isSave?: true; copy?: string }
+
 // The terminal's own background (Ghostty `background`), painted over the pane's
 // shade so the editor matches the transcript.
 const BACKGROUND = '#000000'
+const MATCH_BACKGROUND = '#5c4b12'
 const WHEEL_ROWS = 3
 const UNDO_DEPTH = 100
+const CLICK_MS = 400
 const NAMED = new Set([
   'up', 'down', 'left', 'right', 'return', 'enter', 'tab', 'backspace', 'delete',
   'pageup', 'pagedown', 'home', 'end', 'escape', 'insert',
 ])
+const CLOSED_FIND: Find = { isOpen: false, hasKeys: false, field: 'query', query: '', replace: '' }
 
-function split(text: string): string[] {
-  return text.replace(/\r\n/g, '\n').split('\n')
+function primary(state: State): Caret {
+  return state.carets[0] ?? { row: 0, col: 0 }
 }
 
-function indentUnit(path: string): string {
-  const name = path.slice(path.lastIndexOf('/') + 1)
-  return name.endsWith('.go') || name === 'Makefile' ? '\t' : '  '
-}
-
-function show(line: string): string {
-  return line.replace(/\t/g, '  ').replace(/[\u0000-\u001f\u007f]/g, '\u00b7')
-}
-
-function showCol(line: string, col: number): number {
-  return show(line.slice(0, col)).length
-}
-
-function cellWidth(ch: string): number {
-  if (ch === '\t') return 2
-
-  return /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1
-}
-
-function cells(text: string): number {
-  let used = 0
-  for (const ch of text) used += cellWidth(ch)
-
-  return used
-}
-
-function colAt(line: string, cells: number): number {
-  let used = 0
-  for (let i = 0; i < line.length; i++) {
-    const w = cellWidth(line[i] ?? '')
-    if (used + w / 2 > cells) return i
-    used += w
-  }
-
-  return line.length
-}
-
-function isBefore(a: Spot, b: Spot): boolean {
-  return a.row < b.row || (a.row === b.row && a.col < b.col)
-}
-
-function selected(state: State): Selection | undefined {
-  const anchor = state.anchor
-  if (!anchor || (anchor.row === state.row && anchor.col === state.col)) return undefined
-  const here = { row: state.row, col: state.col }
-  const [from, to] = isBefore(anchor, here) ? [anchor, here] : [here, anchor]
-  const rows = state.lines.slice(from.row, to.row + 1)
-  const last = rows.length - 1
-  const text = rows
-    .map((line, i) => line.slice(i === 0 ? from.col : 0, i === last ? to.col : undefined))
-    .join('\n')
-
-  return { from, to, text }
-}
-
-function editRows(s: Surface, doc: Doc): number {
-  const shown = Math.min(3, doc.diagnostics.length)
+function editRows(s: Surface, state: { doc: Doc; find?: Find }): number {
+  const shown = Math.min(3, state.doc.diagnostics.length) + (state.find?.isOpen ? 1 : 0)
 
   return Math.max(1, (s.rows || 20) - 1 - shown)
 }
 
 function follow(state: State, rows: number): State {
+  const { row } = primary(state)
   let top = state.top
-  if (state.row < top) top = state.row
-  if (state.row >= top + rows) top = state.row - rows + 1
+  if (row < top) top = row
+  if (row >= top + rows) top = row - rows + 1
 
   return { ...state, top: Math.max(0, top) }
 }
 
+function withCarets(state: State, carets: Caret[]): State {
+  return { ...state, carets: merge(carets), snappedAt: 0 }
+}
+
+// Keeps an undo point per burst of typing: a pause of 700 ms starts a new one
 function snap(state: State): State {
   const now = Date.now()
   if (now - state.snappedAt < 700) return { ...state, snappedAt: now }
-  const undo = [...state.undo, { lines: state.lines, row: state.row, col: state.col }]
+  const undo = [...state.undo, { lines: state.lines, carets: state.carets }]
 
   return { ...state, undo: undo.slice(-UNDO_DEPTH), snappedAt: now }
 }
 
-function edited(state: State, lines: string[], row: number, col: number): State {
-  return { ...snap(state), lines, row, col, isDirty: true, editedAt: Date.now(), anchor: undefined }
+function edit(state: State, make: (lines: readonly string[], caret: Caret, index: number) => Edit | undefined): State {
+  const result = applyEdits(state.lines, state.carets, make)
+  if (!result.isChanged) return withCarets(state, result.carets)
+
+  return { ...snap(state), lines: result.lines, carets: result.carets, isDirty: true, redo: [] }
 }
 
-function insert(state: State, text: string): State {
-  const { lines, row, col } = state
-  const line = lines[row] ?? ''
-  const parts = split(text)
-  const head = line.slice(0, col)
-  const tail = line.slice(col)
-  const next = [...lines]
-  if (parts.length === 1) {
-    next[row] = head + text + tail
-
-    return edited(state, next, row, col + text.length)
-  }
-  const last = parts[parts.length - 1] ?? ''
-  const middle = parts.slice(1, -1)
-  next.splice(row, 1, head + (parts[0] ?? ''), ...middle, last + tail)
-
-  return edited(state, next, row + parts.length - 1, last.length)
-}
-
-function newline(state: State): State {
-  const line = state.lines[state.row] ?? ''
-  const indent = /^\s*/.exec(line)?.[0] ?? ''
-
-  return insert(state, '\n' + indent)
-}
-
-function backspace(state: State): State {
-  const { lines, row, col } = state
-  const line = lines[row] ?? ''
-  const next = [...lines]
-  if (col > 0) {
-    next[row] = line.slice(0, col - 1) + line.slice(col)
-
-    return edited(state, next, row, col - 1)
-  }
-  if (row === 0) return state
-  const above = lines[row - 1] ?? ''
-  next.splice(row - 1, 2, above + line)
-
-  return edited(state, next, row - 1, above.length)
-}
-
-function forwardDelete(state: State): State {
-  const { lines, row, col } = state
-  const line = lines[row] ?? ''
-  const next = [...lines]
-  if (col < line.length) {
-    next[row] = line.slice(0, col) + line.slice(col + 1)
-
-    return edited(state, next, row, col)
-  }
-  if (row >= lines.length - 1) return state
-  next.splice(row, 2, line + (lines[row + 1] ?? ''))
-
-  return edited(state, next, row, col)
-}
-
-function dedent(state: State, unit: string): State {
-  const line = state.lines[state.row] ?? ''
-  const cut = line.startsWith(unit) ? unit.length : line.startsWith(' ') ? 1 : 0
-  if (cut === 0) return state
-  const next = [...state.lines]
-  next[state.row] = line.slice(cut)
-
-  return edited(state, next, state.row, Math.max(0, state.col - cut))
-}
-
-function killLine(state: State): State {
-  const line = state.lines[state.row] ?? ''
-  if (state.col >= line.length) return forwardDelete(state)
-  const next = [...state.lines]
-  next[state.row] = line.slice(0, state.col)
-
-  return edited(state, next, state.row, state.col)
-}
-
-function killToStart(state: State): State {
-  if (state.col === 0) return backspace(state)
-  const next = [...state.lines]
-  next[state.row] = (state.lines[state.row] ?? '').slice(state.col)
-
-  return edited(state, next, state.row, 0)
-}
-
-function deleteWord(state: State): State {
-  if (state.col === 0) return backspace(state)
-  const to = wordStep(state, -1).col
-  const line = state.lines[state.row] ?? ''
-  const next = [...state.lines]
-  next[state.row] = line.slice(0, to) + line.slice(state.col)
-
-  return edited(state, next, state.row, to)
-}
-
-function undo(state: State): State {
-  const last = state.undo[state.undo.length - 1]
+function history(state: State, isRedo: boolean): State {
+  const from = isRedo ? state.redo : state.undo
+  const last = from[from.length - 1]
   if (!last) return state
+  const current = { lines: state.lines, carets: state.carets }
 
   return {
     ...state,
     lines: last.lines,
-    row: last.row,
-    col: last.col,
-    undo: state.undo.slice(0, -1),
+    carets: last.carets,
+    undo: isRedo ? [...state.undo, current] : state.undo.slice(0, -1),
+    redo: isRedo ? state.redo.slice(0, -1) : [...state.redo, current],
     isDirty: true,
-    editedAt: Date.now(),
     snappedAt: 0,
-    anchor: undefined,
   }
 }
 
-function removeSelection(state: State, sel: Selection): State {
-  const head = (state.lines[sel.from.row] ?? '').slice(0, sel.from.col)
-  const tail = (state.lines[sel.to.row] ?? '').slice(sel.to.col)
-  const next = [...state.lines]
-  next.splice(sel.from.row, sel.to.row - sel.from.row + 1, head + tail)
+function selectedText(state: State): string | undefined {
+  const parts = state.carets
+    .map(rangeOf)
+    .filter((range): range is Range => range !== undefined)
+    .sort((a, b) => compare(a.from, b.from))
+    .map(range => textIn(state.lines, range))
 
-  return edited(state, next, sel.from.row, sel.from.col)
+  return parts.length > 0 ? parts.join('\n') : undefined
 }
 
+// A paste with as many lines as carets puts one line at each caret
 function paste(state: State, text: string): State {
-  const sel = selected(state)
+  const parts = split(text)
+  const order = state.carets.map((_, i) => i).sort((a, b) => compare(state.carets[a]!, state.carets[b]!))
+  const isSpread = state.carets.length > 1 && parts.length === state.carets.length
 
-  return insert(sel ? removeSelection(state, sel) : state, text)
+  return edit(state, (lines, caret, index) => typeText(isSpread ? (parts[order.indexOf(index)] ?? '') : text)(lines, caret))
 }
 
-function move(state: State, row: number, col: number): State {
-  const r = Math.max(0, Math.min(state.lines.length - 1, row))
-  const c = Math.max(0, Math.min((state.lines[r] ?? '').length, col))
+// Option+D: select the word at the caret, then add the next match of the selection
+function addNextMatch(state: State): State {
+  const first = primary(state)
+  const range = rangeOf(first)
+  if (!range) {
+    const line = state.lines[first.row] ?? ''
+    const [start, end] = wordAt(line, first.col)
+    if (start === end) return state
 
-  return { ...state, row: r, col: c, snappedAt: 0 }
-}
-
-function wordStep(state: State, dir: 1 | -1): State {
-  const line = state.lines[state.row] ?? ''
-  let c = state.col
-  if (dir < 0) {
-    while (c > 0 && /\s/.test(line[c - 1] ?? '')) c--
-    while (c > 0 && /\w/.test(line[c - 1] ?? '')) c--
-    if (c === state.col && c > 0) c--
-  } else {
-    while (c < line.length && /\s/.test(line[c] ?? '')) c++
-    while (c < line.length && /\w/.test(line[c] ?? '')) c++
-    if (c === state.col && c < line.length) c++
+    return withCarets(state, [{ row: first.row, col: end, anchor: { row: first.row, col: start } }, ...state.carets.slice(1)])
   }
+  const matches = findAll(state.lines, textIn(state.lines, range))
+  const taken = new Set(state.carets.map(caret => `${caret.row}:${caret.col}`))
+  const after = nextMatch(matches.filter(match => !taken.has(`${match.to.row}:${match.to.col}`)), range.to, false)
+  if (!after) return state
 
-  return move(state, state.row, c)
+  return withCarets(state, [{ ...after.to, anchor: after.from }, ...state.carets])
 }
 
-function keyed(state: State, k: ClientKeyEvent, page: number): State | 'save' {
-  const unit = indentUnit(state.doc.path)
-  const { row, col } = state
-  const lineLength = (state.lines[row] ?? '').length
+function findMatches(state: State): Range[] {
+  return state.find.isOpen ? findAll(state.lines, state.find.query) : []
+}
 
-  // Ghostty and Terminal.app turn Cmd+arrows and Cmd/Option+Delete into these
-  // readline keys, so they behave as in a macOS text field.
+function goToMatch(state: State, isBack: boolean): State {
+  const matches = findMatches(state)
+  const range = rangeOf(primary(state))
+  const from = isBack ? (range?.from ?? primary(state)) : (range?.to ?? primary(state))
+  const match = nextMatch(matches, from, isBack)
+  if (!match) return state
+
+  return withCarets(state, [{ ...match.to, anchor: match.from }])
+}
+
+function replaceOne(state: State): State {
+  const range = rangeOf(primary(state))
+  const isOnMatch = range !== undefined &&
+    textIn(state.lines, range).toLowerCase() === state.find.query.toLowerCase()
+  if (!isOnMatch) return goToMatch(state, false)
+  const replaced = edit(withCarets(state, [primary(state)]), typeText(state.find.replace))
+
+  return goToMatch(replaced, false)
+}
+
+function replaceAll(state: State): State {
+  const matches = findMatches(state)
+  if (matches.length === 0) return state
+  const carets = matches.map(match => ({ ...match.to, anchor: match.from }))
+  const replaced = edit({ ...state, carets }, typeText(state.find.replace))
+
+  return withCarets(replaced, [primary(replaced)])
+}
+
+function openFind(state: State): State {
+  const range = rangeOf(primary(state))
+  const picked = range && range.from.row === range.to.row ? textIn(state.lines, range) : undefined
+
+  return {
+    ...state,
+    find: { ...state.find, isOpen: true, hasKeys: true, field: 'query', query: picked ?? state.find.query },
+  }
+}
+
+// Keys while the find bar holds them: they edit its fields; Enter steps through
+// the matches, or replaces in the replace field; Option+Enter replaces all
+function findKey(state: State, k: ClientKeyEvent): State {
+  const find = state.find
+  const field = find.field
+  const value = find[field]
+  const set = (text: string) => ({ ...state, find: { ...find, [field]: text } })
+  if (k.ctrl && k.key === 'f') return { ...state, find: CLOSED_FIND }
+  if (k.key === 'tab') return { ...state, find: { ...find, field: field === 'query' ? 'replace' : 'query' } }
+  if (k.key === 'return' || k.key === 'enter') {
+    if (k.meta) return replaceAll(state)
+    if (field === 'replace') return replaceOne(state)
+
+    return goToMatch(state, k.shift === true)
+  }
+  if (k.key === 'backspace') return set(value.slice(0, -1))
+  if (k.meta && k.key === 'backspace') return set('')
+  if (k.key === 'space') return set(value + ' ')
+  if (k.ctrl || k.meta || NAMED.has(k.key)) return state
+  const next = set(value + k.key)
+
+  // Typing in the query searches again from the start of the current match
+  const from = rangeOf(primary(next))?.from ?? primary(next)
+
+  return field === 'query' ? goToMatch({ ...next, carets: [{ row: from.row, col: from.col }] }, false) : next
+}
+
+function motionOf(k: ClientKeyEvent): Motion | undefined {
+  // Ghostty and Terminal.app turn Cmd+arrows into these readline keys, so they
+  // behave as in a macOS text field
   if (k.ctrl) {
-    if (k.key === 's') return 'save'
-    if (k.key === 'z') return undo(state)
-    if (k.key === 'a') return move(state, row, 0)
-    if (k.key === 'e') return move(state, row, lineLength)
-    if (k.key === 'k') return killLine(state)
-    if (k.key === 'u') return killToStart(state)
-    if (k.key === 'w' || k.key === 'backspace') return deleteWord(state)
-    if (k.key === 'left') return wordStep(state, -1)
-    if (k.key === 'right') return wordStep(state, 1)
-    if (k.key === 'home') return move(state, 0, 0)
-    if (k.key === 'end') return move(state, Infinity, Infinity)
-
-    return state
+    const ctrl: Record<string, Motion> = { a: 'home', e: 'end', left: 'wordLeft', right: 'wordRight', home: 'docStart', end: 'docEnd' }
+    return ctrl[k.key]
   }
   if (k.meta) {
-    if (k.key === 'left' || k.key === 'b') return wordStep(state, -1)
-    if (k.key === 'right' || k.key === 'f') return wordStep(state, 1)
-    if (k.key === 'up') return move(state, 0, 0)
-    if (k.key === 'down') return move(state, Infinity, Infinity)
-    if (k.key === 'backspace') return deleteWord(state)
-    if (k.key === 'z') return undo(state)
-    if (k.key === 's') return 'save'
+    const meta: Record<string, Motion> = { left: 'wordLeft', right: 'wordRight', b: 'wordLeft', f: 'wordRight', up: 'docStart', down: 'docEnd' }
+    return meta[k.key]
   }
+  const plain: Record<string, Motion> = {
+    up: 'up', down: 'down', left: 'left', right: 'right', home: 'home', end: 'end', pageup: 'pageUp', pagedown: 'pageDown',
+  }
+
+  return plain[k.key]
+}
+
+function handle(state: State, k: ClientKeyEvent, page: number): Outcome {
+  const unit = indentUnit(state.doc.path)
+  const isSave = (k.ctrl || k.meta) && k.key === 's'
+  if (isSave) return { state, isSave: true }
+  if (state.find.isOpen && state.find.hasKeys) return { state: findKey(state, k) }
+
+  if (k.ctrl && k.key === 'f') return { state: openFind(state) }
+  // Ctrl+Z suspends Claude Code before it reaches a Client, so undo is Option+Z
+  const isRedo = (k.ctrl && k.key === 'y') || (k.meta && (k.key === 'Z' || (k.key === 'z' && k.shift === true)))
+  if (isRedo) return { state: history(state, true) }
+  if (k.meta && k.key === 'z') return { state: history(state, false) }
+  // Ctrl+D ends Claude Code before it reaches a Client, so this is Option+D
+  if (k.meta && k.key === 'd') return { state: addNextMatch(state) }
+  if (k.meta && k.key === 'c') return { state, copy: selectedText(state) }
+  if (k.meta && k.key === 'x') {
+    const copy = selectedText(state)
+    return copy === undefined ? { state } : { state: edit(state, typeText('')), copy }
+  }
+  if (k.meta && k.key === 'a') {
+    const end = clamp(state.lines, { row: Infinity, col: Infinity })
+    return { state: withCarets(state, [{ ...end, anchor: { row: 0, col: 0 } }]) }
+  }
+
+  const motion = motionOf(k)
+  if (motion) {
+    const isExtending = k.shift === true
+    return { state: withCarets(state, state.carets.map(caret => move(state.lines, caret, motion, page, isExtending))) }
+  }
+
+  if (k.ctrl) {
+    if (k.key === 'k') return { state: edit(state, killToEnd) }
+    if (k.key === 'u') return { state: edit(state, killToStart) }
+    if (k.key === 'w' || k.key === 'backspace') return { state: edit(state, deleteWordBack) }
+
+    return { state }
+  }
+  if (k.meta && k.key === 'backspace') return { state: edit(state, deleteWordBack) }
 
   switch (k.key) {
-    case 'up': return move(state, row - 1, col)
-    case 'down': return move(state, row + 1, col)
-    case 'left': return col > 0 ? move(state, row, col - 1) : move(state, row - 1, Infinity)
-    case 'right': return col < lineLength ? move(state, row, col + 1) : move(state, row + 1, 0)
-    case 'home': return move(state, row, 0)
-    case 'end': return move(state, row, lineLength)
-    case 'pageup': return move(state, row - page, col)
-    case 'pagedown': return move(state, row + page, col)
     case 'return':
-    case 'enter': return newline(state)
-    case 'backspace': return backspace(state)
-    case 'delete': return forwardDelete(state)
-    case 'tab': return k.shift ? dedent(state, unit) : insert(state, unit)
-    case 'space': return insert(state, ' ')
+    case 'enter': return { state: edit(state, newline) }
+    case 'backspace': return { state: edit(state, backspace) }
+    case 'delete': return { state: edit(state, deleteForward) }
+    case 'tab': return { state: edit(state, k.shift ? dedent(unit) : typeText(unit)) }
+    case 'space': return { state: edit(state, typeText(' ')) }
   }
-  if (NAMED.has(k.key) || k.meta) return state
+  if (NAMED.has(k.key) || k.meta) return { state }
 
-  return insert(state, k.key)
-}
-
-type Outcome = { state: State; isSave?: true; copy?: string }
-
-const MOVE_KEYS = new Set(['up', 'down', 'left', 'right', 'home', 'end', 'pageup', 'pagedown'])
-const DELETE_KEYS = new Set(['backspace', 'delete'])
-
-function isMove(k: ClientKeyEvent): boolean {
-  if (k.ctrl) return ['a', 'e', 'left', 'right', 'home', 'end'].includes(k.key)
-  if (k.meta) return ['left', 'right', 'up', 'down', 'b', 'f'].includes(k.key)
-
-  return MOVE_KEYS.has(k.key)
-}
-
-function isEdit(k: ClientKeyEvent): boolean {
-  if (k.ctrl) return ['k', 'u', 'w', 'backspace'].includes(k.key)
-  if (k.meta) return k.key === 'backspace'
-  if (k.key === 'tab') return !k.shift
-
-  return !NAMED.has(k.key) || ['return', 'enter', 'backspace', 'delete'].includes(k.key)
-}
-
-// Selection, copy and cut sit above the plain editing keys: Shift extends,
-// Cmd+X and Cmd+C (sent as Option+X and Option+C) cut and copy, typing replaces.
-function handle(state: State, k: ClientKeyEvent, page: number): Outcome {
-  const sel = selected(state)
-  if (k.meta && k.key === 'c') return { state, copy: sel?.text }
-  if (k.meta && k.key === 'x') return sel ? { state: removeSelection(state, sel), copy: sel.text } : { state }
-  if (k.meta && k.key === 'a') return { state: { ...move(state, Infinity, Infinity), anchor: { row: 0, col: 0 } } }
-  if (isMove(k)) {
-    const anchor = k.shift ? (state.anchor ?? { row: state.row, col: state.col }) : undefined
-    const moved = keyed({ ...state, anchor: undefined }, k, page)
-
-    return { state: { ...(moved === 'save' ? state : moved), anchor } }
-  }
-  if (sel && isEdit(k)) {
-    const cleared = removeSelection(state, sel)
-    const isDeleter = DELETE_KEYS.has(k.key) || (k.ctrl && k.key !== 'k') || (k.meta && k.key === 'backspace')
-    if (isDeleter) return { state: cleared }
-    const typed = keyed(cleared, k, page)
-
-    return typed === 'save' ? { state: cleared, isSave: true } : { state: typed }
-  }
-  const result = keyed(state, k, page)
-
-  return result === 'save' ? { state, isSave: true } : { state: result }
+  return { state: edit(state, typeText(k.key)) }
 }
 
 function save(s: Surface, state: State, isActive?: boolean): State {
@@ -388,19 +306,25 @@ function scrollBy(state: State, by: number): State {
 function fresh(doc: Doc): State {
   return {
     lines: split(doc.text),
-    row: 0,
-    col: 0,
+    carets: [{ row: 0, col: 0 }],
     top: 0,
     rev: doc.rev,
     isDirty: false,
-    editedAt: 0,
     undo: [],
+    redo: [],
     snappedAt: 0,
     doc,
     wasFocused: false,
     wheelSeq: 0,
     pasteSeq: 0,
+    find: CLOSED_FIND,
   }
+}
+
+function reload(state: State, text: string): State {
+  const lines = split(text)
+
+  return { ...state, lines, carets: merge(state.carets.map(caret => clamp(lines, caret))) }
 }
 
 function adopt(state: State, doc: Doc): State {
@@ -415,30 +339,61 @@ function adopt(state: State, doc: Doc): State {
   if (isOurSave) {
     const isUntouched = textHash === doc.savedHash
     if (!isUntouched) return { ...base, inflight: undefined }
-    const lines = split(doc.text)
 
-    return { ...move({ ...base, lines }, state.row, state.col), inflight: undefined, isDirty: false }
+    return { ...reload(base, doc.text), inflight: undefined, isDirty: false }
   }
   if (state.isDirty || state.inflight !== undefined) return base
-  const lines = split(doc.text)
 
-  return move({ ...base, lines }, state.row, state.col)
+  return reload(base, doc.text)
+}
+
+// Where a pointer cell lands in the text
+function spotAt(state: State, x: number, y: number): Spot {
+  const gutter = String(state.lines.length).length + 1
+  const row = Math.max(0, Math.min(state.lines.length - 1, state.top + y))
+
+  return { row, col: colAt(state.lines[row] ?? '', x - gutter) }
+}
+
+function clicked(state: State, spot: Spot, isAdding: boolean, isExtending: boolean): State {
+  const now = Date.now()
+  const last = state.click
+  const isRepeat = last !== undefined && now - last.at < CLICK_MS && last.row === spot.row && Math.abs(last.col - spot.col) <= 1
+  const count = isRepeat ? last.count + 1 : 1
+  const base = { ...state, click: { at: now, row: spot.row, col: spot.col, count }, find: { ...state.find, hasKeys: false } }
+  const line = state.lines[spot.row] ?? ''
+  if (count === 2) {
+    const [start, end] = wordAt(line, spot.col)
+    return withCarets(base, [{ row: spot.row, col: end, anchor: { row: spot.row, col: start } }])
+  }
+  if (count >= 3) {
+    const isLast = spot.row >= state.lines.length - 1
+    const end = isLast ? { row: spot.row, col: line.length } : { row: spot.row + 1, col: 0 }
+    return withCarets(base, [{ ...end, anchor: { row: spot.row, col: 0 } }])
+  }
+  if (isAdding) return withCarets(base, [spot, ...state.carets])
+  if (isExtending) {
+    const first = primary(state)
+    return withCarets(base, [{ ...spot, anchor: first.anchor ?? { row: first.row, col: first.col } }])
+  }
+
+  return withCarets(base, [{ ...spot, anchor: spot }])
 }
 
 function start(s: Surface, doc: Doc): State {
   s.onKey(k => {
     const current = s.state
     if (!current) return
-    const rows = editRows(s, current.doc)
+    const rows = editRows(s, current)
     const out = handle(current, k, rows - 1)
     if (out.isSave) {
-      s.setState(follow(save(s, out.state, true), rows))
+      s.setState(follow(save(s, out.state, true), editRows(s, out.state)))
       return
     }
     if (out.copy !== undefined) s.post({ type: 'copy', text: out.copy, isActive: true })
     // The hooks keep the latest text so closing the pane can still save it
     else if (out.state.lines !== current.lines) s.post({ type: 'draft', text: out.state.lines.join('\n'), isActive: true })
-    s.setState(follow(out.state, rows))
+    s.setState(follow(out.state, editRows(s, out.state)))
   })
 
   s.onPointer(e => {
@@ -452,20 +407,22 @@ function start(s: Surface, doc: Doc): State {
       return
     }
     if (e.type === 'up') {
-      const sel = selected(current)
-      s.post(sel ? { type: 'copy', text: sel.text, isActive: true } : { type: 'active', isActive: true })
+      const copy = selectedText(current)
+      s.post(copy !== undefined ? { type: 'copy', text: copy, isActive: true } : { type: 'active', isActive: true })
       return
     }
     if (e.button !== 'left' || (e.type !== 'down' && e.type !== 'move')) return
 
-    const rows = editRows(s, current.doc)
-    const gutter = String(current.lines.length).length + 1
-    const row = Math.max(0, Math.min(current.lines.length - 1, current.top + e.y))
-    const col = colAt(current.lines[row] ?? '', e.x - gutter)
-    const here = { row: current.row, col: current.col }
-    const anchor = e.type === 'down' && !e.shift ? { row, col } : (current.anchor ?? here)
-    if (e.type === 'down') s.post({ type: 'active', isActive: true })
-    s.setState(follow({ ...move(current, row, col), anchor }, rows))
+    const rows = editRows(s, current)
+    const spot = spotAt(current, e.x, e.y)
+    if (e.type === 'down') {
+      s.post({ type: 'active', isActive: true })
+      s.setState(follow(clicked(current, spot, e.alt === true, e.shift === true), rows))
+      return
+    }
+    const first = primary(current)
+    const dragged = { ...spot, anchor: first.anchor ?? { row: first.row, col: first.col } }
+    s.setState(follow(withCarets(current, [dragged, ...current.carets.slice(1)]), rows))
   })
 
   return fresh(doc)
@@ -474,12 +431,11 @@ function start(s: Surface, doc: Doc): State {
 const Editor: ClientModule<EditorProps, State> = (props, s) => {
   const { Box, Text, Code } = s.elements
   const { isFocused, wheel, paste: pasted, ...doc } = props
-  const initial = s.state ?? start(s, doc)
-  let state = initial
-  if (doc.rev > state.rev) state = follow(adopt(state, doc), editRows(s, doc))
+  let state = s.state ?? start(s, doc)
+  if (doc.rev > state.rev) state = follow(adopt(state, doc), editRows(s, state))
   if (wheel && wheel.seq > state.wheelSeq) state = { ...scrollBy(state, wheel.by), wheelSeq: wheel.seq }
   if (pasted && pasted.seq > state.pasteSeq) {
-    state = { ...follow(paste(state, pasted.text), editRows(s, doc)), pasteSeq: pasted.seq }
+    state = { ...follow(paste(state, pasted.text), editRows(s, state)), pasteSeq: pasted.seq }
     s.post({ type: 'draft', text: state.lines.join('\n') })
   }
   if (isFocused !== undefined && isFocused !== state.wasFocused) {
@@ -488,19 +444,21 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
   }
   if (state !== s.state) s.setState(state)
 
-  const rows = editRows(s, state.doc)
+  const rows = editRows(s, state)
   const top = Math.min(state.top, Math.max(0, state.lines.length - 1))
   const end = Math.min(state.lines.length, top + rows)
   const width = String(state.lines.length).length
   const errorLines = new Set(state.doc.diagnostics.map(d => d.line))
   const room = Math.max(4, (s.columns || 60) - width - 2)
+  const first = primary(state)
+  const caretRows = new Set(state.carets.map(caret => caret.row))
 
   const gutter = []
   for (let i = top; i < end; i++) {
     const n = String(i + 1).padStart(width)
     const isError = errorLines.has(i + 1)
     gutter.push(
-      <Text color={isError ? 'error' : undefined} dimColor={!isError} bold={i === state.row}>
+      <Text color={isError ? 'error' : undefined} dimColor={!isError} bold={caretRows.has(i)}>
         {n}
       </Text>,
     )
@@ -516,21 +474,19 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
     </Box>
   )
 
-  const sel = selected(state)
-  const caretLine = state.lines[state.row] ?? ''
-  const caretAt = cells(caretLine.slice(0, state.col))
+  const caretLine = state.lines[first.row] ?? ''
+  const caretAt = cells(caretLine.slice(0, first.col))
   // A caret past the right edge needs its line shifted, so that line alone is plain text
-  const isShifted = caretAt >= room - 1
-  const onScreen = state.row >= top && state.row < end
+  const isShifted = caretAt >= room - 1 && first.row >= top && first.row < end
 
-  // Lines stay one highlighted Code run; the caret and the selection are drawn
-  // over it, so the caret line keeps its colours
+  // Lines stay one highlighted Code run; matches, selections and carets are
+  // drawn over it, so every line keeps its colours
   const parts = []
-  if (isShifted && onScreen) {
+  if (isShifted) {
     const shown = show(caretLine)
-    const at = showCol(caretLine, state.col)
+    const at = show(caretLine.slice(0, first.col)).length
     const shift = Math.max(0, at - room + 2)
-    if (state.row > top) parts.push(block(top, state.row))
+    if (first.row > top) parts.push(block(top, first.row))
     parts.push(
       <Box height={1} flexShrink={0}>
         <Text wrap="truncate-end">
@@ -540,38 +496,67 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
         </Text>
       </Box>,
     )
-    if (state.row + 1 < end) parts.push(block(state.row + 1, end))
+    if (first.row + 1 < end) parts.push(block(first.row + 1, end))
   } else if (end > top) {
     parts.push(block(top, end))
   }
 
-  const overlay = (row: number, left: number, text: string) => (
+  const overlay = (row: number, left: number, text: string, isMatch = false) => (
     <Box position="absolute" top={row - top} left={left} height={1}>
-      <Text inverse wrap="truncate-end">{text}</Text>
+      {isMatch
+        ? <Text backgroundColor={MATCH_BACKGROUND} wrap="truncate-end">{text}</Text>
+        : <Text inverse wrap="truncate-end">{text}</Text>}
     </Box>
   )
-  if (sel) {
-    for (let i = Math.max(top, sel.from.row); i <= Math.min(end - 1, sel.to.row); i++) {
+  const paint = (range: Range, isMatch: boolean) => {
+    for (let i = Math.max(top, range.from.row); i <= Math.min(end - 1, range.to.row); i++) {
+      if (isShifted && i === first.row) continue
       const line = state.lines[i] ?? ''
-      const from = i === sel.from.row ? sel.from.col : 0
-      const to = i === sel.to.row ? sel.to.col : line.length
-      const text = show(line.slice(from, to)) + (i === sel.to.row ? '' : ' ')
-      if (text !== '' && cells(line.slice(0, from)) < room) parts.push(overlay(i, cells(line.slice(0, from)), text))
+      const from = i === range.from.row ? range.from.col : 0
+      const to = i === range.to.row ? range.to.col : line.length
+      const text = show(line.slice(from, to)) + (i === range.to.row ? '' : ' ')
+      const left = cells(line.slice(0, from))
+      if (text !== '' && left < room) parts.push(overlay(i, left, text, isMatch))
     }
-  } else if (onScreen && !isShifted) {
-    const under = caretLine[state.col]
-    parts.push(overlay(state.row, caretAt, under === undefined ? ' ' : show(under)))
+  }
+  const matches = findMatches(state)
+  for (const match of matches) if (match.to.row >= top && match.from.row < end) paint(match, true)
+  for (const caret of state.carets) {
+    const range = rangeOf(caret)
+    if (range) {
+      paint(range, false)
+      continue
+    }
+    const isVisible = caret.row >= top && caret.row < end && !(isShifted && caret.row === first.row)
+    const line = state.lines[caret.row] ?? ''
+    const left = cells(line.slice(0, caret.col))
+    const under = line[caret.col]
+    if (isVisible && left < room) parts.push(overlay(caret.row, left, under === undefined ? ' ' : show(under)))
   }
 
-  const first = state.doc.diagnostics.find(d => d.line === state.row + 1)
+  const near = state.doc.diagnostics.find(d => d.line === first.row + 1)
   const listed = [
-    ...(first ? [first] : []),
-    ...state.doc.diagnostics.filter(d => d !== first),
+    ...(near ? [near] : []),
+    ...state.doc.diagnostics.filter(d => d !== near),
   ].slice(0, 3)
 
   const mark = state.isDirty ? 'unsaved' : state.inflight !== undefined ? 'saving' : state.doc.status
   const count = state.doc.diagnostics.length
   const name = state.doc.path.slice(state.doc.path.lastIndexOf('/') + 1)
+  const carets = state.carets.length > 1 ? `  ${state.carets.length} carets` : ''
+
+  const find = state.find
+  const matchIndex = matches.findIndex(match => {
+    const range = rangeOf(first)
+    return range !== undefined && compare(range.from, match.from) === 0 && compare(range.to, match.to) === 0
+  })
+  const field = (label: string, value: string, isActive: boolean) => (
+    <Text>
+      <Text dimColor>{label} </Text>
+      <Text bold={isActive}>{value}</Text>
+      {isActive && <Text inverse> </Text>}
+    </Text>
+  )
 
   return (
     <Box flexDirection="column" height={s.rows || undefined} backgroundColor={BACKGROUND}>
@@ -581,13 +566,22 @@ const Editor: ClientModule<EditorProps, State> = (props, s) => {
           {parts}
         </Box>
       </Box>
+      {find.isOpen && (
+        <Box flexDirection="row" gap={2} height={1}>
+          {field('Find', find.query, find.hasKeys && find.field === 'query')}
+          {field('Replace', find.replace, find.hasKeys && find.field === 'replace')}
+          <Text dimColor>
+            {matches.length === 0 ? 'no results' : `${matchIndex >= 0 ? matchIndex + 1 : '?'} of ${matches.length}`}
+          </Text>
+        </Box>
+      )}
       {listed.map(d => (
         <Text color="error" wrap="truncate-end">
           {d.line}:{d.col} {d.code} {d.message}
         </Text>
       ))}
       <Text dimColor wrap="truncate-end">
-        {name}  {state.row + 1}:{state.col + 1}  {mark}  {count === 0 ? 'no problems' : `${count} problems`}
+        {name}  {first.row + 1}:{first.col + 1}{carets}  {mark}  {count === 0 ? 'no problems' : `${count} problems`}
       </Text>
     </Box>
   )
