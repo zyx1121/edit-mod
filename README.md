@@ -86,7 +86,6 @@ Cmd+S and Cmd+X then send Option+S and Option+X in every program.
 ## Limits
 
 - A file has a limit of 90000 characters, because the engine limits a message to 100000 characters.
-- The caret line and the selected lines show without colors.
 - Lint runs on save, not as you type. There is no completion yet.
 - Cmd+Z stays with Ghostty, which uses it to reopen a closed tab.
 

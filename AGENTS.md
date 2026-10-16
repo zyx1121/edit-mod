@@ -8,6 +8,7 @@ Claude Code mod (a function-hooks plugin). `hooks/register.tsx` exports `registe
 - Props and posts have a limit of 100000 characters. Never send the full text twice in one message. Use `hashText` from `hooks/hash.ts` to name a text.
 - Save only on Cmd+S, when the pointer leaves the editor, on a prompt submit, on pane close and on session end. Do not add a timer.
 - Draw only the visible lines. Each run of `Code` lines sits in a `Box` with a fixed height, because `Code` grows into free room.
+- Draw the caret and the selection as `position="absolute"` overlays on the `Code` run, so the caret line keeps its colors. Count cells with `cells()`, because wide characters take 2 cells.
 - Strip ANSI escapes and control characters from tool output before it goes into a tree.
 - `types/claude-code.d.ts` is the engine contract. Copy it, do not edit it.
 - Repository documents and code comments are English. No em dashes.
