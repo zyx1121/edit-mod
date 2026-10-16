@@ -9,6 +9,8 @@ Claude Code mod (a function-hooks plugin). `hooks/register.tsx` exports `registe
 - Save only on Cmd+S, when the pointer leaves the editor, on a prompt submit, on pane close and on session end. Do not add a timer.
 - Draw only the visible lines. Each run of `Code` lines sits in a `Box` with a fixed height, because `Code` grows into free room.
 - Draw the caret and the selection as `position="absolute"` overlays on the `Code` run, so the caret line keeps its colors. Count cells with `cells()`, because wide characters take 2 cells.
+- Every edit is a range replacement per caret in `hooks/editor/model.ts`. Add a new edit as a `make` function for `applyEdits`, so it works with many carets. Test it in `tests/model.test.ts`.
+- Claude Code takes Ctrl+C, Ctrl+D and Ctrl+Z before a `Client` sees them, and a terminal sends Ctrl+H as Backspace. Do not bind them. Option keys arrive as `meta`.
 - Strip ANSI escapes and control characters from tool output before it goes into a tree.
 - `types/claude-code.d.ts` is the engine contract. Copy it, do not edit it.
 - Repository documents and code comments are English. No em dashes.

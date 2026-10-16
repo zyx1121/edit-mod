@@ -29,8 +29,10 @@ A small edit in your own hands is often faster than a prompt. A switch to anothe
 - **Open from a prompt**: say "I want to edit demo.ts", and Claude opens the pane with the `open` tool. `/edit <path>` does the same.
 - **Highlighting and lint**: the engine highlights the code. Lint errors mark the line number and show below the code.
 - **Format on save**: `deno fmt` for JavaScript, TypeScript, JSON, CSS, Markdown, YAML and HTML. `ruff` for Python and `gofmt` for Go.
-- **macOS keys**: Cmd and Option with the arrows and Delete, Cmd+S, Cmd+X and Cmd+V. Undo is Ctrl+Z.
-- **Mouse**: click to place the caret, drag to select and copy, scroll with the wheel.
+- **macOS keys**: Cmd and Option with the arrows and Delete, Cmd+S, Cmd+X and Cmd+V.
+- **Find and replace**: Ctrl+F opens a find bar. It highlights every match and replaces one or all.
+- **Multiple carets**: Option+click adds a caret. Option+D adds the next match of the selection.
+- **Mouse**: click to place the caret, double-click to select a word, triple-click to select a line, drag to select and copy, scroll with the wheel.
 - **Follows Claude**: when Claude edits the open file, the pane reloads it.
 
 ## Quick start
@@ -57,11 +59,18 @@ Start a new session and run `/edit <path>`. Click the pane to type. Esc gives th
 | Cmd+S | Save and format |
 | Cmd+X, Cmd+V | Cut the selection, paste at the caret |
 | Drag, Shift with an arrow | Select. A drag copies the selection |
-| Ctrl+Z | Undo |
+| Double-click, triple-click | Select a word, select a line |
+| Option+Z | Undo |
+| Option+Shift+Z, Ctrl+Y | Redo |
+| Ctrl+F | Open or close the find bar |
+| Option+D | Select the word, then add the next match as a caret |
+| Option+click | Add a caret |
 | Cmd+Left, Cmd+Right | Go to the start or end of the line |
 | Option+Left, Option+Right | Go one word |
 | Cmd+Delete, Option+Delete | Delete to the line start, delete one word |
 | Wheel | Scroll 3 lines a tick |
+
+In the find bar, type the text to find. Enter goes to the next match and Shift+Enter to the one before. Tab moves to the replace field, where Enter replaces one match. Option+Enter replaces all.
 
 The pane also saves when the pointer leaves it, when you submit a prompt, when you close the pane and when the session ends. It never saves on a timer.
 
@@ -87,7 +96,7 @@ Cmd+S and Cmd+X then send Option+S and Option+X in every program.
 
 - A file has a limit of 90000 characters, because the engine limits a message to 100000 characters.
 - Lint runs on save, not as you type. There is no completion yet.
-- Cmd+Z stays with Ghostty, which uses it to reopen a closed tab.
+- Cmd+Z stays with Ghostty, which uses it to reopen a closed tab. Claude Code takes Ctrl+Z, Ctrl+D and Ctrl+C before the editor sees them, so undo is Option+Z.
 
 ## For AI agents
 
