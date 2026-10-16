@@ -405,12 +405,17 @@ async function answerLsp(
     }
     const eol = text.includes('\r\n') ? '\r\n' : '\n'
     const next = applyTextEdits(split(text), list).join(eol)
-    await $.fs.write(file, next)
+    // A file that cannot be written (read only, say) is skipped like a changed one
+    const isWritten = await $.fs.write(file, next).then(() => true, () => false)
+    if (!isWritten) {
+      skipped++
+      continue
+    }
     await lspTell($, file, next)
     others++
   }
   const renamed = others > 0 ? `renamed in ${others + 1} files` : 'renamed'
-  const note = skipped > 0 ? `${renamed}, ${skipped} skipped: they changed, rename again` : renamed
+  const note = skipped > 0 ? `${renamed}, ${skipped} skipped: changed or read only` : renamed
 
   return propsFor($, { seq: data.seq, edits: edits.get(path) ?? [], note })
 }
@@ -466,13 +471,16 @@ export const register: Register = on => {
       if (typeof data.text === 'string') await $.ui.copy({ text: data.text, surface: e.surface })
       return {}
     }
-    const props = data.type === 'chunk'
-      ? await answerChunk($, data.seq, data.rev, data.index)
+    // Every request gets an answer, or the editor waits for it forever
+    const answer = async () => data.type === 'chunk'
+      ? answerChunk($, data.seq, data.rev, data.index)
       : data.type === 'sync'
-      ? await answerSync($, data)
+      ? answerSync($, data)
       : data.type === 'complete' || data.type === 'hover' || data.type === 'definition' || data.type === 'rename'
-      ? await gated($, data.seq, () => answerLsp($, data))
+      ? gated($, data.seq, () => answerLsp($, data))
       : undefined
+    const seq = 'seq' in data ? data.seq : 0
+    const props = await answer().catch(error => propsFor($, { seq, isFailed: true, note: `failed: ${firstLine(String(error))}` }))
 
     return props ? { props } : next(e)
   })
